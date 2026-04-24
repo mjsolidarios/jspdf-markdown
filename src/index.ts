@@ -1,6 +1,121 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import type {
+  Color as AutoTableColor,
+  Styles as AutoTableStyles,
+  ThemeType as AutoTableThemeType,
+  UserOptions as AutoTableUserOptions,
+} from 'jspdf-autotable';
 import { lexer, Token, Tokens } from 'marked';
+
+// ---------------------------------------------------------------------------
+// Table styling public types
+// ---------------------------------------------------------------------------
+
+/**
+ * Styling overrides for a section of a table. All fields are optional
+ * and map 1:1 to jspdf-autotable's `Styles` interface, so anything
+ * autoTable supports can be set here. `fillColor: false` disables the
+ * default fill for a section (e.g. to drop alternate-row striping).
+ *
+ * @see https://github.com/simonbengtsson/jsPDF-AutoTable#styling
+ */
+export type TableCellStyles = Partial<Omit<AutoTableStyles, 'fillColor'>> & {
+  /** Fill colour, or `false` to disable the default fill. */
+  fillColor?: AutoTableColor | false;
+};
+
+/**
+ * Declarative table styling. Applied to every Markdown table (GFM pipe
+ * tables and raw HTML `<table>` blocks alike). All fields are optional;
+ * unspecified fields fall back to the library's defaults.
+ *
+ * @example Brand-coloured header with zebra striping
+ * ```ts
+ * const tableStyles: TableStyles = {
+ *   headStyles: {
+ *     fillColor: [25, 55, 120],
+ *     textColor: [255, 255, 255],
+ *     halign: 'center',
+ *   },
+ *   alternateRowStyles: { fillColor: [240, 245, 255] },
+ *   columnStyles: { 2: { halign: 'right', fontStyle: 'bold' } },
+ * };
+ * markdownToPdf(doc, md, { tableStyles });
+ * ```
+ *
+ * @example Escape hatch for autoTable-only options
+ * ```ts
+ * markdownToPdf(doc, md, {
+ *   tableStyles: {
+ *     customize: (opts) => ({ ...opts, rowPageBreak: 'avoid' }),
+ *   },
+ * });
+ * ```
+ */
+export interface TableStyles {
+  /**
+   * autoTable theme.
+   *
+   * - `'striped'` (default): alternate body rows get
+   *   {@link TableStyles.alternateRowStyles}.
+   * - `'grid'`: borders on every side, no alternate stripe by default.
+   * - `'plain'`: no borders and no alternate stripe by default.
+   */
+  theme?: AutoTableThemeType;
+  /**
+   * Base styles inherited by every section. Library defaults:
+   * `{ fontSize: options.fontSize * 0.9, font: options.fontFamily,
+   * cellPadding: 2, valign: 'middle' }`.
+   */
+  styles?: TableCellStyles;
+  /**
+   * Overrides for header rows. Library defaults: dark-grey fill
+   * (`[80, 80, 80]`), white bold text.
+   */
+  headStyles?: TableCellStyles;
+  /** Overrides for body rows. No defaults; inherits from `styles`. */
+  bodyStyles?: TableCellStyles;
+  /**
+   * Overrides for striped alternate body rows. Only applied when
+   * `theme === 'striped'`. Library default: `{ fillColor: [248, 248, 248] }`.
+   * Pass `fillColor: false` to drop the stripe while keeping stripes on.
+   */
+  alternateRowStyles?: TableCellStyles;
+  /**
+   * Per-column overrides keyed by zero-based column index. A user entry
+   * here wins over GFM column-alignment (`:---:`) for the same column.
+   *
+   * ```ts
+   * columnStyles: {
+   *   0: { fontStyle: 'bold' },
+   *   2: { halign: 'right', textColor: [20, 100, 40] },
+   * }
+   * ```
+   */
+  columnStyles?: Record<string | number, TableCellStyles>;
+  /**
+   * Escape hatch: last-mile customisation. Invoked with the fully
+   * composed autoTable options (including head/body, merged styles,
+   * and the rich-cell `willDrawCell` / `didDrawCell` hooks for GFM
+   * tables) and must return the options that will be passed to
+   * `autoTable`. Spread the argument to keep the library defaults:
+   *
+   * ```ts
+   * customize: (opts) => ({
+   *   ...opts,
+   *   rowPageBreak: 'avoid',
+   *   didDrawPage: (data) => {
+   *     doc.text(`Page ${data.pageNumber}`, 15, 10);
+   *   },
+   * })
+   * ```
+   *
+   * Running this for a raw HTML `<table>` is also supported (the
+   * rich-cell hooks are only set for GFM tables).
+   */
+  customize?: (options: AutoTableUserOptions) => AutoTableUserOptions;
+}
 
 /** User-configurable options for the markdown-to-PDF renderer. */
 export interface MarkdownToPdfOptions {
@@ -34,6 +149,23 @@ export interface MarkdownToPdfOptions {
   hrColor?: [number, number, number];
   /** Color for link text as [r,g,b]. Default: [0,0,238] */
   linkColor?: [number, number, number];
+  /**
+   * Custom table styling applied to every Markdown table rendered with
+   * these options — GFM pipe tables **and** raw HTML `<table>` blocks
+   * (including merged-cell tables using `colspan` / `rowspan`).
+   *
+   * Declarative fields (`styles`, `headStyles`, `bodyStyles`,
+   * `alternateRowStyles`, `columnStyles`, `theme`) are shallow-merged
+   * on top of the library's defaults. User `columnStyles[i]` wins over
+   * GFM column alignment for the same column. For anything autoTable
+   * supports that isn't surfaced here, use
+   * {@link TableStyles.customize} to rewrite the final autoTable
+   * options just before they're invoked.
+   *
+   * @see {@link TableStyles}
+   * @see {@link TableCellStyles}
+   */
+  tableStyles?: TableStyles;
 }
 
 interface ResolvedOptions {
@@ -52,6 +184,7 @@ interface ResolvedOptions {
   blockquoteColor: [number, number, number];
   hrColor: [number, number, number];
   linkColor: [number, number, number];
+  tableStyles: TableStyles;
 }
 
 type RGB = [number, number, number];
@@ -97,6 +230,7 @@ function resolveOptions(opts?: MarkdownToPdfOptions): ResolvedOptions {
     blockquoteColor: opts?.blockquoteColor ?? [200, 200, 200],
     hrColor: opts?.hrColor ?? [180, 180, 180],
     linkColor: opts?.linkColor ?? [0, 0, 238],
+    tableStyles: opts?.tableStyles ?? {},
   };
 }
 
@@ -810,8 +944,8 @@ function hasInlineStyling(runs: TextRun[]): boolean {
   );
 }
 
-/** One laid-out line of text inside a cell. */
-interface CellLine {
+/** One laid-out line of inline runs, ready to draw at a position. */
+interface InlineLine {
   segments: Array<{ text: string; run: TextRun; xOffset: number; width: number }>;
   width: number;
 }
@@ -819,15 +953,17 @@ interface CellLine {
 /**
  * Lay out a run list into lines, wrapping at `maxWidth`. Measurements use
  * the run's own font (with `forceBold` merged in, matching autoTable's
- * bold header rendering).
+ * bold header rendering when laying out table cells).
  */
-function layoutCellRuns(
+function layoutInlineRuns(
   doc: jsPDF,
   opts: ResolvedOptions,
   runs: TextRun[],
   maxWidth: number,
   forceBold: boolean,
-): CellLine[] {
+  fontFamilyOverride?: string,
+): InlineLine[] {
+  const fontFamily = fontFamilyOverride ?? opts.fontFamily;
   type Piece =
     | { kind: 'word'; text: string; run: TextRun; width: number }
     | { kind: 'space'; width: number }
@@ -838,7 +974,7 @@ function layoutCellRuns(
     if (run.code) {
       setFont(doc, opts.codeFontFamily, false, false);
     } else {
-      setFont(doc, opts.fontFamily, forceBold || run.bold, run.italic);
+      setFont(doc, fontFamily, forceBold || run.bold, run.italic);
     }
     const spaceWidth = doc.getTextWidth(' ');
     const chunks = run.text.split('\n');
@@ -863,8 +999,8 @@ function layoutCellRuns(
     }
   }
 
-  const lines: CellLine[] = [];
-  let cur: CellLine = { segments: [], width: 0 };
+  const lines: InlineLine[] = [];
+  let cur: InlineLine = { segments: [], width: 0 };
   let pendingSpace = 0;
 
   for (const p of pieces) {
@@ -891,13 +1027,78 @@ function layoutCellRuns(
   }
   lines.push(cur);
 
-  setFont(doc, opts.fontFamily, false, false);
+  setFont(doc, fontFamily, false, false);
   return lines;
 }
 
 /**
+ * Draw a list of pre-laid-out inline lines anchored at (`boxX`, `baselineY`)
+ * with a given per-line content width. Each line is shifted horizontally
+ * by `halign` and drawn top-down using `opts.lineHeight`.
+ *
+ * Returns the y position after the last line (one line-height below its
+ * baseline), useful for chaining further rendering.
+ */
+function drawInlineLines(
+  doc: jsPDF,
+  opts: ResolvedOptions,
+  lines: InlineLine[],
+  boxX: number,
+  baselineY: number,
+  boxWidth: number,
+  halign: 'left' | 'center' | 'right',
+  defaultColor: RGB,
+  forceBold: boolean,
+  fontFamilyOverride?: string,
+): number {
+  const fontFamily = fontFamilyOverride ?? opts.fontFamily;
+  const fontSize = doc.getFontSize();
+  const lineHeightMm = ptToMm(fontSize) * opts.lineHeight;
+
+  let y = baselineY;
+  for (const line of lines) {
+    let offset = 0;
+    if (halign === 'center') offset = Math.max(0, (boxWidth - line.width) / 2);
+    else if (halign === 'right') offset = Math.max(0, boxWidth - line.width);
+    const lineX = boxX + offset;
+
+    for (const seg of line.segments) {
+      const run = seg.run;
+      if (run.code) {
+        setFont(doc, opts.codeFontFamily, false, false);
+      } else {
+        setFont(doc, fontFamily, forceBold || run.bold, run.italic);
+      }
+      if (run.link) {
+        doc.setTextColor(...opts.linkColor);
+      } else {
+        doc.setTextColor(defaultColor[0], defaultColor[1], defaultColor[2]);
+      }
+      const drawX = lineX + seg.xOffset;
+      doc.text(seg.text, drawX, y);
+
+      if (run.link || run.strikethrough) {
+        const decorY = run.strikethrough
+          ? y - ptToMm(fontSize) * 0.3
+          : y + 0.3;
+        const color: RGB = run.link ? opts.linkColor : defaultColor;
+        doc.setDrawColor(...color);
+        doc.setLineWidth(0.2);
+        doc.line(drawX, decorY, drawX + seg.width, decorY);
+      }
+    }
+    y += lineHeightMm;
+  }
+
+  setFont(doc, opts.fontFamily, false, false);
+  doc.setTextColor(0, 0, 0);
+  return y;
+}
+
+/**
  * Draw a list of pre-laid-out lines inside an autoTable cell, respecting
- * the cell's `halign` / `valign` and filling in per-run font styles.
+ * the cell's `halign` / `valign` and padding. A thin adapter around
+ * `drawInlineLines`.
  */
 function drawRichCell(
   doc: jsPDF,
@@ -908,12 +1109,20 @@ function drawRichCell(
     width: number;
     height: number;
     padding: (n: 'top' | 'bottom' | 'left' | 'right') => number;
-    styles: { halign?: string; valign?: string; textColor?: unknown };
+    styles: {
+      halign?: string;
+      valign?: string;
+      textColor?: unknown;
+      fontSize?: number;
+      font?: string;
+    };
   },
   runs: TextRun[],
   forceBold: boolean,
 ): void {
-  const fontSize = doc.getFontSize();
+  const fontSize = cell.styles.fontSize ?? doc.getFontSize();
+  const fontFamily = cell.styles.font ?? opts.fontFamily;
+  doc.setFontSize(fontSize);
   const lineHeightMm = ptToMm(fontSize) * opts.lineHeight;
   const padLeft = cell.padding('left');
   const padRight = cell.padding('right');
@@ -922,11 +1131,11 @@ function drawRichCell(
   const availWidth = Math.max(0, cell.width - padLeft - padRight);
   const availHeight = Math.max(0, cell.height - padTop - padBottom);
 
-  const lines = layoutCellRuns(doc, opts, runs, availWidth, forceBold);
+  const lines = layoutInlineRuns(doc, opts, runs, availWidth, forceBold, fontFamily);
   const totalHeight = Math.max(0, lines.length * lineHeightMm);
 
   const valign = cell.styles.valign ?? 'top';
-  const halign = cell.styles.halign ?? 'left';
+  const halign = (cell.styles.halign as 'left' | 'center' | 'right' | undefined) ?? 'left';
 
   let baselineY: number;
   if (valign === 'middle') {
@@ -943,51 +1152,138 @@ function drawRichCell(
     ? [cellColor[0] ?? 0, cellColor[1] ?? 0, cellColor[2] ?? 0]
     : [0, 0, 0];
 
-  let y = baselineY;
-  for (const line of lines) {
-    let offset = 0;
-    if (halign === 'center') offset = (availWidth - line.width) / 2;
-    else if (halign === 'right') offset = availWidth - line.width;
-    const lineX = cell.x + padLeft + offset;
+  drawInlineLines(
+    doc,
+    opts,
+    lines,
+    cell.x + padLeft,
+    baselineY,
+    availWidth,
+    halign,
+    defaultColor,
+    forceBold,
+    fontFamily,
+  );
+}
 
-    for (const seg of line.segments) {
-      const run = seg.run;
-      if (run.code) {
-        setFont(doc, opts.codeFontFamily, false, false);
-      } else {
-        setFont(doc, opts.fontFamily, forceBold || run.bold, run.italic);
-      }
-      if (run.link) {
-        doc.setTextColor(...opts.linkColor);
-      } else {
-        doc.setTextColor(defaultColor[0], defaultColor[1], defaultColor[2]);
-      }
-      const drawX = lineX + seg.xOffset;
-      doc.text(seg.text, drawX, y);
-
-      if (run.link || run.strikethrough) {
-        const lineY = run.strikethrough
-          ? y - ptToMm(fontSize) * 0.3
-          : y + 0.3;
-        const color: RGB = run.link ? opts.linkColor : defaultColor;
-        doc.setDrawColor(...color);
-        doc.setLineWidth(0.2);
-        doc.line(drawX, lineY, drawX + seg.width, lineY);
-      }
-    }
-    y += lineHeightMm;
+/** Shallow-merge a list of style objects; later entries win. */
+function mergeStyles(
+  ...styles: Array<Partial<AutoTableStyles> | undefined>
+): Partial<AutoTableStyles> {
+  const out: Partial<AutoTableStyles> = {};
+  for (const s of styles) {
+    if (s) Object.assign(out, s);
   }
-
-  setFont(doc, opts.fontFamily, false, false);
-  doc.setTextColor(0, 0, 0);
+  return out;
 }
 
 /**
- * Render a GFM table using jspdf-autotable. Supports column alignment
- * (`:---`, `:---:`, `---:`), inline formatting inside cells
- * (**bold**, *italic*, `code`, [links](…), ~~strikethrough~~), and
- * `<br>` line breaks. Merged cells are not part of GFM; use a raw
- * `<table>` block with `colspan`/`rowspan` attributes for those.
+ * Build the autoTable configuration shared by GFM pipe tables and raw
+ * HTML `<table>` blocks.
+ *
+ * Merges, in order:
+ * 1. The library's baked-in defaults (dark-grey header, striped
+ *    alternate rows, 90%-scale body font, 2 mm padding, …).
+ * 2. User-provided {@link TableStyles} from `opts.tableStyles`.
+ * 3. GFM column alignment (`:---:`) for columns the user didn't
+ *    explicitly style via `columnStyles`.
+ *
+ * The resulting options still need `head` / `body` (and, for GFM
+ * tables, the rich-cell hooks) to be added by the caller before being
+ * passed through {@link finaliseTableOptions}.
+ */
+function buildTableOptions(
+  state: RenderState,
+  gfmColumnStyles?: Record<string, Partial<AutoTableStyles>>,
+): AutoTableUserOptions {
+  const { opts } = state;
+  const user = opts.tableStyles;
+
+  const columnStyles: Record<string, Partial<AutoTableStyles>> = {};
+  if (gfmColumnStyles) {
+    for (const [k, v] of Object.entries(gfmColumnStyles)) {
+      columnStyles[k] = { ...v };
+    }
+  }
+  if (user.columnStyles) {
+    for (const [k, v] of Object.entries(user.columnStyles)) {
+      columnStyles[k] = {
+        ...(columnStyles[k] ?? {}),
+        ...(v as Partial<AutoTableStyles>),
+      };
+    }
+  }
+
+  return {
+    startY: state.y + opts.blockSpacing,
+    margin: { left: opts.marginLeft, right: opts.marginRight },
+    theme: user.theme ?? 'striped',
+    styles: mergeStyles(
+      {
+        fontSize: opts.fontSize * 0.9,
+        font: opts.fontFamily,
+        cellPadding: 2,
+        valign: 'middle',
+      },
+      user.styles as Partial<AutoTableStyles> | undefined,
+    ),
+    headStyles: mergeStyles(
+      {
+        fillColor: [80, 80, 80],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+      },
+      user.headStyles as Partial<AutoTableStyles> | undefined,
+    ),
+    bodyStyles: user.bodyStyles as Partial<AutoTableStyles> | undefined,
+    // Only ship the default zebra-stripe under the 'striped' theme so
+    // that `theme: 'plain'` and `theme: 'grid'` render as expected.
+    alternateRowStyles: mergeStyles(
+      (user.theme ?? 'striped') === 'striped'
+        ? { fillColor: [248, 248, 248] }
+        : undefined,
+      user.alternateRowStyles as Partial<AutoTableStyles> | undefined,
+    ),
+    columnStyles,
+  };
+}
+
+/**
+ * Apply the user's {@link TableStyles.customize} callback (if set) to
+ * the final autoTable options and return the result. This runs last,
+ * *after* all declarative tableStyles have been merged in and *after*
+ * the caller has added `head`, `body`, and any rich-cell hooks.
+ */
+function finaliseTableOptions(
+  opts: ResolvedOptions,
+  options: AutoTableUserOptions,
+): AutoTableUserOptions {
+  const customize = opts.tableStyles.customize;
+  return customize ? customize(options) : options;
+}
+
+/**
+ * Render a GFM pipe table via jspdf-autotable.
+ *
+ * Features:
+ * - Column alignment via `:---`, `:---:`, `---:`.
+ * - Full inline formatting inside cells: **bold**, *italic*,
+ *   `code`, [links](…), ~~strikethrough~~, and `<br>` line breaks.
+ * - Cell styling is routed through {@link buildTableOptions} so the
+ *   user's {@link TableStyles} fully applies (fills, borders, fonts,
+ *   padding, per-column overrides, `customize` escape hatch).
+ *
+ * Cells that contain inline styling are re-drawn by
+ * {@link drawRichCell} inside autoTable's
+ * `willDrawCell` / `didDrawCell` hooks so bold / italic / code / link
+ * styling survives the default cell rendering. The font size, font
+ * family, and default text colour for those rich runs are taken from
+ * the per-cell autoTable styles, so `headStyles.fontSize = 14`
+ * correctly scales header rich-cells as well.
+ *
+ * Merged cells are not part of GFM; use a raw `<table>` block with
+ * `colspan` / `rowspan` attributes for those — see
+ * {@link renderHtmlTable}.
  */
 function renderTable(state: RenderState, token: Tokens.Table): RenderState {
   const { doc, opts } = state;
@@ -1012,9 +1308,9 @@ function renderTable(state: RenderState, token: Tokens.Table): RenderState {
   const head: string[][] = [headRich.map((c) => c.plain)];
   const body: string[][] = bodyRich.map((row) => row.map((c) => c.plain));
 
-  const columnStyles: Record<string, { halign: 'left' | 'center' | 'right' }> = {};
+  const gfmColumnStyles: Record<string, Partial<AutoTableStyles>> = {};
   (token.align ?? []).forEach((a, i) => {
-    columnStyles[String(i)] = { halign: mapAlign(a) };
+    gfmColumnStyles[String(i)] = { halign: mapAlign(a) };
   });
 
   const richFor = (section: string, rowIdx: number, colIdx: number) => {
@@ -1023,27 +1319,11 @@ function renderTable(state: RenderState, token: Tokens.Table): RenderState {
     return undefined;
   };
 
-  autoTable(doc, {
+  const base = buildTableOptions(state, gfmColumnStyles);
+  const options = finaliseTableOptions(opts, {
+    ...base,
     head,
     body,
-    startY: state.y + opts.blockSpacing,
-    margin: { left: opts.marginLeft, right: opts.marginRight },
-    styles: {
-      fontSize: opts.fontSize * 0.9,
-      font: opts.fontFamily,
-      cellPadding: 2,
-      valign: 'middle',
-    },
-    headStyles: {
-      fillColor: [80, 80, 80],
-      textColor: [255, 255, 255],
-      fontStyle: 'bold',
-    },
-    alternateRowStyles: {
-      fillColor: [248, 248, 248],
-    },
-    columnStyles,
-    theme: 'striped',
     willDrawCell: (data) => {
       const rich = richFor(data.section, data.row.index, data.column.index);
       if (rich && hasInlineStyling(rich.runs)) {
@@ -1059,6 +1339,8 @@ function renderTable(state: RenderState, token: Tokens.Table): RenderState {
       }
     },
   });
+
+  autoTable(doc, options);
 
   const lastY =
     (doc as jsPDF & { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ??
@@ -1112,9 +1394,17 @@ function parseHtmlTableRows(html: string): HtmlTableCell[][] {
 }
 
 /**
- * Render a raw HTML `<table>` block, including `colspan`/`rowspan`
- * merged-cell support. Returns `null` when the block is not a table, so
- * the caller can fall through to its default html handling.
+ * Render a raw HTML `<table>` block, including `colspan` / `rowspan`
+ * merged-cell support.
+ *
+ * The same {@link TableStyles} as GFM tables applies — fills, borders,
+ * per-column overrides, theme, and the `customize` escape hatch all
+ * work — but cells are rendered as plain strings (no inline markdown
+ * parsing inside HTML cells). `<br>` inside a cell becomes a newline;
+ * other HTML inside cells is stripped.
+ *
+ * Returns `null` when the block is not a table, so the caller can fall
+ * through to its default HTML handling.
  */
 function renderHtmlTable(state: RenderState, rawHtml: string): RenderState | null {
   const outer = rawHtml.match(/<table\b[^>]*>([\s\S]*?)<\/table>/i);
@@ -1152,25 +1442,14 @@ function renderHtmlTable(state: RenderState, rawHtml: string): RenderState | nul
     rowSpan: c.rowSpan,
   });
 
-  autoTable(doc, {
+  const base = buildTableOptions(state);
+  const options = finaliseTableOptions(opts, {
+    ...base,
     head: headRows.map((r) => r.map(toCellDef)),
     body: bodyRows.map((r) => r.map(toCellDef)),
-    startY: state.y + opts.blockSpacing,
-    margin: { left: opts.marginLeft, right: opts.marginRight },
-    styles: {
-      fontSize: opts.fontSize * 0.9,
-      font: opts.fontFamily,
-      cellPadding: 2,
-      valign: 'middle',
-    },
-    headStyles: {
-      fillColor: [80, 80, 80],
-      textColor: [255, 255, 255],
-      fontStyle: 'bold',
-    },
-    alternateRowStyles: { fillColor: [248, 248, 248] },
-    theme: 'striped',
   });
+
+  autoTable(doc, options);
 
   const lastY =
     (doc as jsPDF & { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ??
@@ -1215,8 +1494,473 @@ function renderToken(state: RenderState, token: Token): RenderState {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Precise-layout public API
+// ---------------------------------------------------------------------------
+
+/** The current rendering cursor: page, and baseline coordinates in mm. */
+export interface LayoutCursor {
+  /** 1-based page number. */
+  page: number;
+  /** Left edge used for subsequent block rendering (mm). */
+  x: number;
+  /** Top edge used for subsequent block rendering (mm). */
+  y: number;
+}
+
 /**
- * Parse a markdown string and render it into a jsPDF document.
+ * A rectangular region to render a markdown block into. Any omitted field
+ * falls back to the layout's current cursor / page dimensions.
+ */
+export interface LayoutRegion {
+  /** Left edge (mm). Defaults to the current cursor x. */
+  x?: number;
+  /** Top edge (mm). Defaults to the current cursor y. */
+  y?: number;
+  /** Content width (mm). Defaults to `pageWidth − x − marginRight`. */
+  width?: number;
+  /**
+   * If set, the layout will start the region on a new page when the
+   * remaining space on the current page is less than `minHeight` mm. Use
+   * this to avoid orphaning a heading at the bottom of a page.
+   */
+  minHeight?: number;
+}
+
+/** Result returned by {@link MarkdownLayout.renderMarkdown}. */
+export interface BlockRenderResult {
+  /** Page the block started on (1-based). */
+  startPage: number;
+  /** Page the block finished on (1-based). */
+  endPage: number;
+  /** Y position of the cursor after the block finishes, on `endPage` (mm). */
+  endY: number;
+  /** Total vertical height the block consumed, flattening page breaks (mm). */
+  height: number;
+  /** Number of pages the block spanned (≥ 1). */
+  pageCount: number;
+}
+
+/** Horizontal alignment for inline text. */
+export type InlineAlign = 'left' | 'center' | 'right';
+
+/** Options for drawing a single run of inline markdown at a specific point. */
+export interface InlineRenderOptions {
+  /** Left edge of the text box (mm). */
+  x: number;
+  /** Top edge of the first line's text box (mm). */
+  y: number;
+  /**
+   * Wrap width (mm). Without a value the text is drawn on a single line
+   * (no wrapping).
+   */
+  maxWidth?: number;
+  /** Horizontal alignment inside `maxWidth`. Default: `'left'`. */
+  align?: InlineAlign;
+  /** Font size in pt. Defaults to the layout's base `fontSize`. */
+  fontSize?: number;
+  /**
+   * Text colour as `[r,g,b]`. Defaults to `[0,0,0]`. Links always use
+   * `options.linkColor` regardless of this value.
+   */
+  color?: RGB;
+  /** If `true`, start from bold weight even for non-bold runs. Default: `false`. */
+  bold?: boolean;
+  /** If `true`, start from italic even for non-italic runs. Default: `false`. */
+  italic?: boolean;
+}
+
+/** Result returned by {@link MarkdownLayout.renderInline}. */
+export interface InlineRenderResult {
+  /** Top edge of the line following the last drawn line (mm). */
+  endY: number;
+  /** Baseline y of the last drawn line (mm). */
+  lastBaselineY: number;
+  /** Number of wrapped lines actually drawn. */
+  lines: number;
+  /** Widest line drawn (mm). */
+  width: number;
+  /** Total height consumed, `lines × lineHeight` (mm). */
+  height: number;
+}
+
+/** Result returned by {@link MarkdownLayout.measureMarkdown}. */
+export interface MeasureResult {
+  /** Total flattened height in mm, summed across the pages the content spans. */
+  height: number;
+  /** Number of pages the content would span. */
+  pageCount: number;
+  /** Final y position on the last page (mm). */
+  endY: number;
+}
+
+/**
+ * `MarkdownLayout` is the low-level, precise-layout API.
+ *
+ * It wraps a `jsPDF` instance and lets callers:
+ *
+ * - Render markdown blocks at arbitrary positions and widths (columns,
+ *   call-out boxes, constrained regions).
+ * - Render a single line of inline markdown anywhere on the page with
+ *   left / center / right alignment — perfect for headers, footers, page
+ *   numbers and stamps.
+ * - Measure how much space markdown will occupy before drawing it.
+ * - Read and move the rendering cursor, switch pages, and interleave raw
+ *   `jsPDF` drawing calls between markdown renders.
+ *
+ * Every option from {@link MarkdownToPdfOptions} — including
+ * {@link MarkdownToPdfOptions.tableStyles tableStyles} for branded
+ * tables, fonts, colours, and margins — is accepted by the constructor
+ * and applies to every render call made through this instance.
+ *
+ * For the common case — "render this markdown string into a PDF" — use
+ * {@link markdownToPdf}, which is just a thin wrapper over this class.
+ *
+ * @example
+ * ```ts
+ * const doc = new jsPDF();
+ * const layout = new MarkdownLayout(doc);
+ *
+ * // Two columns of markdown side-by-side.
+ * const left = layout.renderMarkdown(leftMd, { x: 15, y: 30, width: 85 });
+ * const right = layout.renderMarkdown(rightMd, { x: 110, y: 30, width: 85 });
+ *
+ * // Continue full-width underneath the taller column.
+ * layout.setCursor({ y: Math.max(left.endY, right.endY) + 10 });
+ * layout.renderMarkdown(footerMd);
+ *
+ * // Page-number footer on every page.
+ * const pages = doc.getNumberOfPages();
+ * for (let p = 1; p <= pages; p++) {
+ *   doc.setPage(p);
+ *   layout.renderInline(`Page **${p}** of **${pages}**`, {
+ *     x: 15,
+ *     y: layout.pageHeight() - 12,
+ *     maxWidth: layout.contentWidth(),
+ *     align: 'right',
+ *     fontSize: 9,
+ *   });
+ * }
+ * ```
+ */
+export class MarkdownLayout {
+  /** The underlying jsPDF document. */
+  readonly doc: jsPDF;
+  /** Fully resolved rendering options. */
+  readonly options: Readonly<ResolvedOptions>;
+
+  private cursorX: number;
+  private cursorY: number;
+
+  constructor(doc: jsPDF, options?: MarkdownToPdfOptions) {
+    this.doc = doc;
+    this.options = resolveOptions(options);
+    this.cursorX = this.options.marginLeft;
+    this.cursorY = this.options.marginTop;
+  }
+
+  // -- Page geometry --------------------------------------------------------
+
+  /** Width of the current page in mm. */
+  pageWidth(): number {
+    return this.doc.internal.pageSize.getWidth();
+  }
+
+  /** Height of the current page in mm. */
+  pageHeight(): number {
+    return this.doc.internal.pageSize.getHeight();
+  }
+
+  /** `pageWidth − marginLeft − marginRight` in mm. */
+  contentWidth(): number {
+    return this.pageWidth() - this.options.marginLeft - this.options.marginRight;
+  }
+
+  /** `pageHeight − marginTop − marginBottom` in mm. */
+  contentHeight(): number {
+    return this.pageHeight() - this.options.marginTop - this.options.marginBottom;
+  }
+
+  /**
+   * Space remaining between the current cursor and the bottom margin, in mm.
+   * Handy before calling {@link renderMarkdown} to decide whether to add a
+   * page first.
+   */
+  remainingHeight(): number {
+    return this.pageHeight() - this.options.marginBottom - this.cursorY;
+  }
+
+  // -- Cursor / page management --------------------------------------------
+
+  /** Read the current cursor (page, x, y). */
+  getCursor(): LayoutCursor {
+    return {
+      page: this.doc.getCurrentPageInfo().pageNumber,
+      x: this.cursorX,
+      y: this.cursorY,
+    };
+  }
+
+  /**
+   * Move the cursor and optionally switch to a different page. Any field
+   * left `undefined` is kept unchanged.
+   */
+  setCursor(c: Partial<LayoutCursor>): this {
+    if (c.page !== undefined) this.doc.setPage(c.page);
+    if (c.x !== undefined) this.cursorX = c.x;
+    if (c.y !== undefined) this.cursorY = c.y;
+    return this;
+  }
+
+  /** Append a new page and reset the cursor to the top margin. */
+  addPage(): this {
+    this.doc.addPage();
+    this.cursorX = this.options.marginLeft;
+    this.cursorY = this.options.marginTop;
+    return this;
+  }
+
+  /** Advance the cursor y by `mm` mm. */
+  addSpace(mm: number): this {
+    this.cursorY += mm;
+    return this;
+  }
+
+  /**
+   * Ensure at least `mm` mm of vertical space remain on the current page;
+   * otherwise add a new page. Returns `true` if a page was added.
+   */
+  ensureSpace(mm: number): boolean {
+    if (this.remainingHeight() < mm) {
+      this.addPage();
+      return true;
+    }
+    return false;
+  }
+
+  // -- Block rendering ------------------------------------------------------
+
+  /**
+   * Render a markdown string (block-level, multi-paragraph) into a region.
+   * The region's (x, y, width) override margins for this call; subsequent
+   * content wraps within `width` and breaks across pages as needed.
+   */
+  renderMarkdown(markdown: string, region?: LayoutRegion): BlockRenderResult {
+    const x = region?.x ?? this.cursorX;
+    const y = region?.y ?? this.cursorY;
+    const width = region?.width ?? (this.pageWidth() - x - this.options.marginRight);
+
+    if (region?.minHeight !== undefined && this.remainingHeight() < region.minHeight) {
+      this.addPage();
+    }
+
+    const localOpts: ResolvedOptions = {
+      ...this.options,
+      marginLeft: x,
+      marginRight: this.pageWidth() - x - width,
+    };
+
+    const startPage = this.doc.getCurrentPageInfo().pageNumber;
+    const startY = y;
+
+    let state: RenderState = {
+      doc: this.doc,
+      y,
+      opts: localOpts,
+      pageWidth: this.pageWidth(),
+      contentWidth: width,
+      listIndent: 0,
+      textColor: [0, 0, 0],
+    };
+
+    this.doc.setFontSize(localOpts.fontSize);
+    setFont(this.doc, localOpts.fontFamily, false, false);
+
+    const tokens = lexer(markdown);
+    for (const tok of tokens) {
+      state = renderToken(state, tok);
+    }
+
+    const endPage = this.doc.getCurrentPageInfo().pageNumber;
+    const endY = state.y;
+
+    this.cursorX = x;
+    this.cursorY = endY;
+
+    const contentH = this.pageHeight() - this.options.marginTop - this.options.marginBottom;
+    const pageCount = endPage - startPage + 1;
+    const height =
+      pageCount === 1
+        ? Math.max(0, endY - startY)
+        : (pageCount - 1) * contentH + Math.max(0, endY - this.options.marginTop) +
+          Math.max(0, this.pageHeight() - this.options.marginBottom - startY);
+
+    return { startPage, endPage, endY, pageCount, height };
+  }
+
+  /**
+   * Measure a markdown block without drawing to the real document. Uses a
+   * throwaway jsPDF with the same page dimensions.
+   */
+  measureMarkdown(markdown: string, width?: number): MeasureResult {
+    const pw = this.pageWidth();
+    const ph = this.pageHeight();
+    const measureDoc = new jsPDF({ unit: 'mm', format: [pw, ph] });
+    const measureLayout = new MarkdownLayout(measureDoc, this.options);
+    const w = width ?? measureLayout.contentWidth();
+    const r = measureLayout.renderMarkdown(markdown, {
+      x: this.options.marginLeft,
+      y: this.options.marginTop,
+      width: w,
+    });
+    return { height: r.height, pageCount: r.pageCount, endY: r.endY };
+  }
+
+  // -- Inline rendering -----------------------------------------------------
+
+  /**
+   * Render a short markdown fragment (inline only — `**bold**`, `*italic*`,
+   * `` `code` ``, `[links](…)`, `~~strike~~`, `<br>` ) as a single wrapped
+   * text box anchored at (x, y). Returns measurements of what was drawn.
+   */
+  renderInline(markdown: string, opts: InlineRenderOptions): InlineRenderResult {
+    const runs = inlineRunsFromMarkdown(markdown, this.options);
+    const fontSize = opts.fontSize ?? this.options.fontSize;
+    const align = opts.align ?? 'left';
+    const color: RGB = opts.color ?? [0, 0, 0];
+
+    const prevFontSize = this.doc.getFontSize();
+    this.doc.setFontSize(fontSize);
+    setFont(this.doc, this.options.fontFamily, !!opts.bold, !!opts.italic);
+
+    const maxWidth =
+      opts.maxWidth ?? Number.POSITIVE_INFINITY;
+    const lines = layoutInlineRuns(
+      this.doc,
+      this.options,
+      runs,
+      maxWidth,
+      !!opts.bold,
+    );
+
+    const lineHeightMm = ptToMm(fontSize) * this.options.lineHeight;
+    const firstBaseline = opts.y + ptToMm(fontSize);
+    const boxWidth = isFinite(maxWidth)
+      ? maxWidth
+      : Math.max(0, ...lines.map((l) => l.width));
+
+    const endY = drawInlineLines(
+      this.doc,
+      this.options,
+      lines,
+      opts.x,
+      firstBaseline,
+      boxWidth,
+      align,
+      color,
+      !!opts.bold,
+    );
+
+    this.doc.setFontSize(prevFontSize);
+
+    const width = Math.max(0, ...lines.map((l) => l.width));
+    const totalHeight = lines.length * lineHeightMm;
+    return {
+      endY,
+      lastBaselineY: endY - lineHeightMm,
+      lines: lines.length,
+      width,
+      height: totalHeight,
+    };
+  }
+
+  /** Measure inline markdown without drawing it. */
+  measureInline(
+    markdown: string,
+    opts?: { maxWidth?: number; fontSize?: number; bold?: boolean; italic?: boolean },
+  ): { width: number; height: number; lines: number } {
+    const runs = inlineRunsFromMarkdown(markdown, this.options);
+    const fontSize = opts?.fontSize ?? this.options.fontSize;
+
+    const prevFontSize = this.doc.getFontSize();
+    this.doc.setFontSize(fontSize);
+    setFont(this.doc, this.options.fontFamily, !!opts?.bold, !!opts?.italic);
+
+    const maxWidth = opts?.maxWidth ?? Number.POSITIVE_INFINITY;
+    const lines = layoutInlineRuns(
+      this.doc,
+      this.options,
+      runs,
+      maxWidth,
+      !!opts?.bold,
+    );
+
+    setFont(this.doc, this.options.fontFamily, false, false);
+    this.doc.setFontSize(prevFontSize);
+
+    const lineHeightMm = ptToMm(fontSize) * this.options.lineHeight;
+    const width = Math.max(0, ...lines.map((l) => l.width));
+    return {
+      width,
+      height: lines.length * lineHeightMm,
+      lines: lines.length,
+    };
+  }
+}
+
+/**
+ * Parse a (possibly multi-paragraph) markdown snippet and flatten it down
+ * to a list of inline runs, suitable for {@link renderInline}. Paragraph
+ * breaks become newline runs so that `layoutInlineRuns` keeps them on
+ * separate lines.
+ */
+function inlineRunsFromMarkdown(
+  markdown: string,
+  opts: ResolvedOptions,
+): TextRun[] {
+  const tokens = lexer(markdown);
+  const inline: Token[] = [];
+  let first = true;
+  for (const t of tokens) {
+    if (t.type === 'space') continue;
+    if (!first) {
+      inline.push({ type: 'text', raw: '\n', text: '\n' } as Tokens.Text);
+    }
+    first = false;
+    if (t.type === 'paragraph') {
+      const children = (t as Tokens.Paragraph).tokens;
+      if (children) inline.push(...children);
+    } else if (t.type === 'text') {
+      const text = t as Tokens.Text;
+      if (text.tokens) inline.push(...text.tokens);
+      else inline.push(t);
+    } else if (t.type === 'heading') {
+      const h = t as Tokens.Heading;
+      if (h.tokens) inline.push(...h.tokens);
+    } else {
+      inline.push(t);
+    }
+  }
+  return collectRuns(
+    inline,
+    false,
+    false,
+    false,
+    false,
+    undefined,
+    false,
+    opts.showLinkUrls,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Convenience wrapper
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a markdown string and render it into a jsPDF document, starting
+ * at the top margin and flowing down. Internally a thin wrapper around
+ * {@link MarkdownLayout}.
  *
  * @param doc      An existing jsPDF instance to render into.
  * @param markdown The markdown string to render.
@@ -1238,29 +1982,8 @@ export function markdownToPdf(
   markdown: string,
   options?: MarkdownToPdfOptions,
 ): jsPDF {
-  const opts = resolveOptions(options);
-  const pageWidth = doc.internal.pageSize.getWidth();
-  const contentWidth = pageWidth - opts.marginLeft - opts.marginRight;
-
-  const tokens = lexer(markdown);
-
-  let state: RenderState = {
-    doc,
-    y: opts.marginTop,
-    opts,
-    pageWidth,
-    contentWidth,
-    listIndent: 0,
-    textColor: [0, 0, 0],
-  };
-
-  doc.setFontSize(opts.fontSize);
-  setFont(doc, opts.fontFamily, false, false);
-
-  for (const token of tokens) {
-    state = renderToken(state, token);
-  }
-
+  const layout = new MarkdownLayout(doc, options);
+  layout.renderMarkdown(markdown);
   return doc;
 }
 

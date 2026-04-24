@@ -1,5 +1,5 @@
 import { jsPDF } from 'jspdf';
-import { markdownToPdf } from '../src/index';
+import { markdownToPdf, MarkdownLayout } from '../src/index';
 
 /**
  * Helper: create a fresh jsPDF document for testing.
@@ -559,5 +559,687 @@ console.log(greet('World'));
 Thank you for using **jspdf-markdown**!
 `;
     expect(() => render(md)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Precise-layout API – MarkdownLayout
+// ---------------------------------------------------------------------------
+
+const PT_PER_MM = 72 / 25.4;
+
+/** One text literal drawn to a PDF, with the x/y (mm) of its baseline. */
+interface PositionedToken {
+  text: string;
+  xMm: number;
+  yMm: number;
+}
+
+/**
+ * Extract `<x> <y> Td (text) Tj` triples from a jsPDF output, normalising
+ * the y coordinate to millimetres-from-top so numbers used in render calls
+ * can be asserted against. `pageHeightMm` defaults to A4.
+ */
+function extractPositioned(doc: jsPDF, pageHeightMm = 297): PositionedToken[] {
+  const raw = doc.output();
+  const tokens: PositionedToken[] = [];
+  const re = /([\d.-]+)\s+([\d.-]+)\s+Td\s*\(((?:[^()\\]|\\[()\\])*)\)\s*Tj/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    const x = parseFloat(m[1]) / PT_PER_MM;
+    const yPt = parseFloat(m[2]);
+    const yFromTop = pageHeightMm - yPt / PT_PER_MM;
+    tokens.push({
+      text: m[3].replace(/\\([()\\])/g, '$1'),
+      xMm: x,
+      yMm: yFromTop,
+    });
+  }
+  return tokens;
+}
+
+describe('MarkdownLayout – construction and cursor', () => {
+  it('exposes the jsPDF document and resolved options', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    expect(layout.doc).toBe(doc);
+    expect(layout.options.marginLeft).toBe(15);
+    expect(layout.options.fontSize).toBe(11);
+  });
+
+  it('initialises the cursor at the top margin', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    expect(layout.getCursor()).toEqual({ page: 1, x: 15, y: 20 });
+  });
+
+  it('setCursor updates position and can switch pages', () => {
+    const doc = makeDoc();
+    doc.addPage();
+    const layout = new MarkdownLayout(doc);
+    layout.setCursor({ page: 2, x: 40, y: 100 });
+    expect(layout.getCursor()).toEqual({ page: 2, x: 40, y: 100 });
+  });
+
+  it('addPage resets the cursor to the top margin of the new page', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    layout.setCursor({ y: 250 });
+    layout.addPage();
+    expect(layout.getCursor()).toEqual({ page: 2, x: 15, y: 20 });
+  });
+
+  it('exposes page geometry in mm', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    expect(Math.round(layout.pageWidth())).toBe(210);
+    expect(Math.round(layout.pageHeight())).toBe(297);
+    expect(Math.round(layout.contentWidth())).toBe(180);
+    expect(Math.round(layout.contentHeight())).toBe(257);
+  });
+
+  it('ensureSpace adds a page only when the remaining height is insufficient', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    expect(layout.ensureSpace(50)).toBe(false);
+    layout.setCursor({ y: 270 });
+    expect(layout.ensureSpace(50)).toBe(true);
+    expect(layout.getCursor().page).toBe(2);
+    expect(layout.getCursor().y).toBe(20);
+  });
+});
+
+describe('MarkdownLayout – renderMarkdown in custom regions', () => {
+  it('renders a block anchored at a given x, and subsequent text starts at x', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    layout.renderMarkdown('Hello world', { x: 60, y: 40, width: 100 });
+    const tokens = extractPositioned(doc);
+    const hello = tokens.find((t) => t.text === 'Hello');
+    expect(hello).toBeDefined();
+    expect(hello!.xMm).toBeCloseTo(60, 0);
+  });
+
+  it('wraps a long paragraph within the region width, not the default content width', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const longText =
+      'Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod.';
+    layout.renderMarkdown(longText, { x: 20, y: 30, width: 40 });
+    const tokens = extractPositioned(doc);
+    const ys = new Set(tokens.map((t) => Math.round(t.yMm)));
+    expect(ys.size).toBeGreaterThan(2);
+    for (const t of tokens) {
+      expect(t.xMm).toBeGreaterThanOrEqual(20 - 0.5);
+      expect(t.xMm).toBeLessThanOrEqual(60 + 0.5);
+    }
+  });
+
+  it('returns a result that reports the end cursor and at least 1 page', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const result = layout.renderMarkdown('Hello world', {
+      x: 20,
+      y: 30,
+      width: 100,
+    });
+    expect(result.startPage).toBe(1);
+    expect(result.endPage).toBe(1);
+    expect(result.pageCount).toBe(1);
+    expect(result.endY).toBeGreaterThan(30);
+    expect(result.height).toBeGreaterThan(0);
+  });
+
+  it('updates the cursor to the end position after a region render', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const before = layout.getCursor();
+    const r = layout.renderMarkdown('Hello world', { x: 40, y: 80, width: 80 });
+    const after = layout.getCursor();
+    expect(after.x).toBe(40);
+    expect(after.y).toBe(r.endY);
+    expect(after.y).toBeGreaterThan(before.y);
+  });
+
+  it('renders two markdown columns side-by-side without interference', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const left = 'Left column content. Some words here for wrapping.';
+    const right = 'Right column content. Other words here for wrapping.';
+    const lres = layout.renderMarkdown(left, { x: 15, y: 30, width: 80 });
+    const rres = layout.renderMarkdown(right, { x: 110, y: 30, width: 80 });
+    expect(lres.startPage).toBe(1);
+    expect(rres.startPage).toBe(1);
+    const tokens = extractPositioned(doc);
+    const leftTok = tokens.find((t) => t.text === 'Left');
+    const rightTok = tokens.find((t) => t.text === 'Right');
+    expect(leftTok).toBeDefined();
+    expect(rightTok).toBeDefined();
+    expect(leftTok!.xMm).toBeCloseTo(15, 0);
+    expect(rightTok!.xMm).toBeCloseTo(110, 0);
+    expect(rightTok!.xMm).toBeGreaterThan(leftTok!.xMm + 80);
+  });
+
+  it('respects minHeight by moving to a new page when the current one is too full', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    layout.setCursor({ y: 270 });
+    const r = layout.renderMarkdown('# A heading', { minHeight: 40 });
+    expect(r.startPage).toBe(2);
+  });
+
+  it('markdownToPdf remains equivalent to new MarkdownLayout().renderMarkdown()', () => {
+    const md = '# Title\n\nSome **bold** text.';
+    const docA = makeDoc();
+    markdownToPdf(docA, md);
+    const docB = makeDoc();
+    new MarkdownLayout(docB).renderMarkdown(md);
+    const a = extractPositioned(docA).map((t) => t.text);
+    const b = extractPositioned(docB).map((t) => t.text);
+    expect(b).toEqual(a);
+  });
+});
+
+describe('MarkdownLayout – renderInline', () => {
+  it('renders a single line at an exact x baseline', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    layout.renderInline('Header text', { x: 50, y: 10 });
+    const tokens = extractPositioned(doc);
+    const header = tokens.find((t) => t.text === 'Header');
+    expect(header).toBeDefined();
+    expect(header!.xMm).toBeCloseTo(50, 0);
+  });
+
+  it('right-aligns text within maxWidth', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const rr = layout.renderInline('Page 1', {
+      x: 20,
+      y: 10,
+      maxWidth: 170,
+      align: 'right',
+    });
+    const tokens = extractPositioned(doc);
+    const page = tokens.find((t) => t.text === 'Page');
+    expect(page).toBeDefined();
+    const expectedLeft = 20 + 170 - rr.width;
+    expect(page!.xMm).toBeGreaterThan(expectedLeft - 5);
+    expect(page!.xMm).toBeLessThan(20 + 170);
+  });
+
+  it('center-aligns text within maxWidth', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const rr = layout.renderInline('Hi', {
+      x: 0,
+      y: 10,
+      maxWidth: 100,
+      align: 'center',
+    });
+    const tokens = extractPositioned(doc);
+    const hi = tokens.find((t) => t.text === 'Hi');
+    expect(hi).toBeDefined();
+    expect(hi!.xMm).toBeCloseTo((100 - rr.width) / 2, 0);
+  });
+
+  it('preserves inline markdown formatting inside a single-line render', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    layout.renderInline('Hello **bold** and *italic* words', { x: 20, y: 20 });
+    const texts = extractPositioned(doc).map((t) => t.text);
+    expect(texts).toEqual(
+      expect.arrayContaining(['Hello', 'bold', 'and', 'italic', 'words']),
+    );
+  });
+
+  it('wraps inline content when maxWidth is small', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const rr = layout.renderInline(
+      'one two three four five six seven eight nine ten',
+      { x: 20, y: 20, maxWidth: 30 },
+    );
+    expect(rr.lines).toBeGreaterThan(1);
+  });
+
+  it('reports width and line count for a single-line render', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const rr = layout.renderInline('Short text', { x: 10, y: 10 });
+    expect(rr.lines).toBe(1);
+    expect(rr.width).toBeGreaterThan(0);
+    expect(rr.height).toBeGreaterThan(0);
+  });
+
+  it('uses the provided font size for subsequent lines', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const small = layout.renderInline('Line one\nLine two', {
+      x: 15,
+      y: 20,
+      fontSize: 8,
+    });
+    const big = layout.renderInline('Line one\nLine two', {
+      x: 15,
+      y: 60,
+      fontSize: 24,
+    });
+    expect(big.height).toBeGreaterThan(small.height * 2);
+  });
+
+  it('does not advance the block cursor (inline renders are positional)', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const before = layout.getCursor();
+    layout.renderInline('Stamp', { x: 180, y: 10 });
+    const after = layout.getCursor();
+    expect(after).toEqual(before);
+  });
+});
+
+describe('MarkdownLayout – measurement', () => {
+  it('measureMarkdown returns a positive height for real content', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const m = layout.measureMarkdown('# Title\n\nSome body text.', 150);
+    expect(m.height).toBeGreaterThan(0);
+    expect(m.pageCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('measureMarkdown does not mutate the real document or cursor', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const pagesBefore = doc.getNumberOfPages();
+    const tokensBefore = extractPositioned(doc).length;
+    layout.measureMarkdown(
+      Array.from({ length: 100 }, (_, i) => `Paragraph ${i}`).join('\n\n'),
+      150,
+    );
+    expect(doc.getNumberOfPages()).toBe(pagesBefore);
+    expect(extractPositioned(doc).length).toBe(tokensBefore);
+    expect(layout.getCursor()).toEqual({ page: 1, x: 15, y: 20 });
+  });
+
+  it('measureMarkdown height approximates actual render height', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const md = '# Header\n\nParagraph one.\n\nParagraph two.';
+    const measured = layout.measureMarkdown(md, 150);
+    const r = layout.renderMarkdown(md, { x: 15, y: 20, width: 150 });
+    expect(measured.height).toBeCloseTo(r.height, 0);
+  });
+
+  it('measureInline reports width and height for a single line', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const m = layout.measureInline('Hello world');
+    expect(m.width).toBeGreaterThan(0);
+    expect(m.lines).toBe(1);
+    expect(m.height).toBeGreaterThan(0);
+  });
+
+  it('measureInline with a tight maxWidth reports multiple lines', () => {
+    const layout = new MarkdownLayout(makeDoc());
+    const m = layout.measureInline(
+      'one two three four five six seven eight nine ten',
+      { maxWidth: 20 },
+    );
+    expect(m.lines).toBeGreaterThan(1);
+  });
+
+  it('measureInline does not draw anything', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const before = extractPositioned(doc).length;
+    layout.measureInline('Hello world');
+    expect(extractPositioned(doc).length).toBe(before);
+  });
+});
+
+describe('MarkdownLayout – end-to-end scenarios', () => {
+  it('supports the page-number footer recipe on every page', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    layout.renderMarkdown(
+      Array.from({ length: 50 }, (_, i) => `Paragraph ${i}`).join('\n\n'),
+    );
+    const totalPages = doc.getNumberOfPages();
+    expect(totalPages).toBeGreaterThanOrEqual(2);
+    for (let p = 1; p <= totalPages; p++) {
+      doc.setPage(p);
+      layout.renderInline(`Page ${p}`, {
+        x: 15,
+        y: layout.pageHeight() - 12,
+        maxWidth: layout.contentWidth(),
+        align: 'right',
+        fontSize: 9,
+      });
+    }
+    const footers = extractPositioned(doc).filter((t) => t.text === 'Page');
+    expect(footers.length).toBe(totalPages);
+  });
+
+  it('supports a two-column layout with a shared full-width footer', () => {
+    const doc = makeDoc();
+    const layout = new MarkdownLayout(doc);
+    const left = layout.renderMarkdown('Left column content here.', {
+      x: 15,
+      y: 30,
+      width: 85,
+    });
+    const right = layout.renderMarkdown('Right column content here.', {
+      x: 110,
+      y: 30,
+      width: 85,
+    });
+    layout.setCursor({ x: 15, y: Math.max(left.endY, right.endY) + 10 });
+    const footer = layout.renderMarkdown('**Footer** spans the full width.');
+    expect(footer.startPage).toBe(1);
+    const tokens = extractPositioned(doc);
+    const footerTok = tokens.find((t) => t.text === 'Footer');
+    expect(footerTok).toBeDefined();
+    expect(footerTok!.xMm).toBeCloseTo(15, 0);
+    expect(footerTok!.yMm).toBeGreaterThan(
+      Math.max(left.endY, right.endY) + 5,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Custom table styling
+// ---------------------------------------------------------------------------
+
+/** Dump the raw PDF content stream as a single string. */
+function rawOutput(doc: jsPDF): string {
+  return doc.output();
+}
+
+/**
+ * Test helper: render markdown and return the raw PDF output. jsPDF
+ * emits pure-grey colours via the `g` operator and non-grey colours
+ * via `rg`, so tests that want to unambiguously assert on a fill
+ * should use a non-grey colour like `[255, 0, 0]`.
+ */
+function renderRaw(
+  markdown: string,
+  options?: Parameters<typeof markdownToPdf>[2],
+): string {
+  return rawOutput(render(markdown, options));
+}
+
+/**
+ * Format a 0–255 colour channel the way jsPDF writes it to the PDF
+ * content stream at a given decimal-places precision. jsPDF uses:
+ *   - 2 decimal places for `setFillColor` (fills)
+ *   - 3 decimal places for `setTextColor` (text)
+ * Both use the `rg` operator, so tests that want to count either should
+ * use {@link countRgb} which sums matches at both precisions.
+ */
+function fmtChannel(n: number, dp: number): string {
+  const v = n / 255;
+  if (v === 0) return '0.';
+  if (v === 1) return '1.';
+  return v.toFixed(dp).replace(/(\.\d)0+$/, '$1');
+}
+
+/** Count occurrences of `r g b rg` for the given colour and precision. */
+function countRgbAt(
+  raw: string,
+  [r, g, b]: [number, number, number],
+  dp: number,
+): number {
+  const esc = (s: string) => s.replace(/\./g, '\\.');
+  const re = new RegExp(
+    `${esc(fmtChannel(r, dp))}\\s+${esc(fmtChannel(g, dp))}\\s+${esc(fmtChannel(b, dp))}\\s+rg`,
+    'g',
+  );
+  return (raw.match(re) ?? []).length;
+}
+
+/**
+ * Count `rg` occurrences for a colour, trying both 2-dp (fill) and
+ * 3-dp (text) rounding so a single assertion works regardless of which
+ * jsPDF API was used to set it.
+ */
+function countRgb(raw: string, color: [number, number, number]): number {
+  return countRgbAt(raw, color, 2) + countRgbAt(raw, color, 3);
+}
+
+// Kept as a back-compat alias for the tests below.
+const countRgbFill = countRgb;
+
+const BASIC_TABLE = [
+  '| Name | Qty |',
+  '|------|----:|',
+  '| Apple | 1 |',
+  '| Banana | 2 |',
+  '| Cherry | 3 |',
+].join('\n');
+
+describe('tableStyles – fills and colours', () => {
+  it('applies custom headStyles.fillColor to header cells', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: { headStyles: { fillColor: [255, 0, 0] } },
+    });
+    expect(countRgbFill(raw, [255, 0, 0])).toBeGreaterThan(0);
+  });
+
+  it('applies custom bodyStyles.textColor (drawn via rg in the stream)', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: { bodyStyles: { textColor: [0, 128, 255] } },
+    });
+    expect(countRgbFill(raw, [0, 128, 255])).toBeGreaterThan(0);
+  });
+
+  it('applies custom alternateRowStyles.fillColor', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: { alternateRowStyles: { fillColor: [0, 255, 128] } },
+    });
+    expect(countRgbFill(raw, [0, 255, 128])).toBeGreaterThan(0);
+  });
+
+  it('drops the default alternate-row stripe when fillColor is false', () => {
+    const withDefault = renderRaw(BASIC_TABLE);
+    const withoutStripe = renderRaw(BASIC_TABLE, {
+      tableStyles: { alternateRowStyles: { fillColor: false as never } },
+    });
+    // Default stripe is [248, 248, 248] → "0.97 g" in greyscale.
+    expect(withDefault).toMatch(/0\.97\s+g/);
+    expect(withoutStripe).not.toMatch(/0\.97\s+g/);
+  });
+
+  it('overrides both head fill and text colour together', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: {
+        headStyles: { fillColor: [50, 100, 200], textColor: [255, 220, 100] },
+      },
+    });
+    expect(countRgbFill(raw, [50, 100, 200])).toBeGreaterThan(0);
+    expect(countRgbFill(raw, [255, 220, 100])).toBeGreaterThan(0);
+  });
+});
+
+describe('tableStyles – theme and layout', () => {
+  it("theme='plain' drops the default alternate-row stripe", () => {
+    const striped = renderRaw(BASIC_TABLE);
+    const plain = renderRaw(BASIC_TABLE, {
+      tableStyles: { theme: 'plain' },
+    });
+    // Default alternate-row stripe [248, 248, 248] renders as "0.97 g".
+    expect(striped).toMatch(/0\.97\s+g/);
+    expect(plain).not.toMatch(/0\.97\s+g/);
+  });
+
+  it('propagates a custom theme through to autoTable', () => {
+    const customize = jest.fn((o: { [k: string]: unknown }) => o);
+    render(BASIC_TABLE, {
+      tableStyles: { theme: 'grid', customize: customize as never },
+    });
+    expect(customize.mock.calls[0][0]).toHaveProperty('theme', 'grid');
+  });
+
+  it('increases the table height when cellPadding is increased', () => {
+    const read = (options?: Parameters<typeof markdownToPdf>[2]) => {
+      const doc = render(BASIC_TABLE, options);
+      return (
+        (doc as unknown as { lastAutoTable?: { finalY?: number } })
+          .lastAutoTable?.finalY ?? 0
+      );
+    };
+    const defaultY = read();
+    const paddedY = read({ tableStyles: { styles: { cellPadding: 8 } } });
+    expect(paddedY).toBeGreaterThan(defaultY + 10);
+  });
+
+  it('propagates a custom fontSize from tableStyles.styles', () => {
+    const smaller = render(BASIC_TABLE);
+    const larger = render(BASIC_TABLE, {
+      tableStyles: { styles: { fontSize: 20 } },
+    });
+    const smallY =
+      (smaller as unknown as { lastAutoTable?: { finalY?: number } })
+        .lastAutoTable?.finalY ?? 0;
+    const largeY =
+      (larger as unknown as { lastAutoTable?: { finalY?: number } })
+        .lastAutoTable?.finalY ?? 0;
+    expect(largeY).toBeGreaterThan(smallY + 5);
+  });
+});
+
+describe('tableStyles – columnStyles override GFM alignment', () => {
+  it('applies halign from user columnStyles', () => {
+    const doc = render(BASIC_TABLE, {
+      tableStyles: {
+        columnStyles: {
+          0: { halign: 'right' },
+        },
+      },
+    });
+    const tokens = extractPositioned(doc);
+    const appleTok = tokens.find((t) => t.text === 'Apple');
+    const bananaTok = tokens.find((t) => t.text === 'Banana');
+    expect(appleTok).toBeDefined();
+    expect(bananaTok).toBeDefined();
+    // Both column-0 cells should be right-aligned, so their right edges
+    // align (not their left). Longer 'Banana' starts further left than
+    // shorter 'Apple' when right-aligned.
+    expect(bananaTok!.xMm).toBeLessThan(appleTok!.xMm);
+  });
+
+  it('user columnStyles wins over GFM column alignment', () => {
+    // The GFM table aligns column 1 (Qty) to the right via `|----:|`.
+    // With a user override forcing halign:'left', column-1 body cells
+    // should start at the same x for different-length values.
+    const doc = render(BASIC_TABLE, {
+      tableStyles: { columnStyles: { 1: { halign: 'left' } } },
+    });
+    const tokens = extractPositioned(doc);
+    // All body cells in column 1 have single-digit numbers, so lengths
+    // are identical anyway. Instead, compare left-edge x of column-1
+    // "1" cell with the same cell when GFM alignment is kept (right).
+    const qty1Override = tokens.find((t) => t.text === '1');
+    expect(qty1Override).toBeDefined();
+
+    const docDefault = render(BASIC_TABLE);
+    const defaultTokens = extractPositioned(docDefault);
+    const qty1Default = defaultTokens.find((t) => t.text === '1');
+    expect(qty1Default).toBeDefined();
+
+    expect(qty1Override!.xMm).toBeLessThan(qty1Default!.xMm);
+  });
+});
+
+describe('tableStyles – customize escape hatch', () => {
+  it('invokes customize with the fully composed autoTable options', () => {
+    const customize = jest.fn((o: { [k: string]: unknown }) => o);
+    render(BASIC_TABLE, {
+      tableStyles: { customize: customize as never },
+    });
+    expect(customize).toHaveBeenCalledTimes(1);
+    const options = customize.mock.calls[0][0];
+    expect(options).toHaveProperty('head');
+    expect(options).toHaveProperty('body');
+    expect(options).toHaveProperty('styles');
+    expect(options).toHaveProperty('headStyles');
+    expect(options).toHaveProperty('theme', 'striped');
+  });
+
+  it('customize can completely replace the headStyles', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: {
+        customize: (opts) => ({
+          ...opts,
+          headStyles: { ...opts.headStyles, fillColor: [0, 200, 0] },
+        }),
+      },
+    });
+    expect(countRgbFill(raw, [0, 200, 0])).toBeGreaterThan(0);
+  });
+
+  it('customize runs after the declarative tableStyles merge', () => {
+    const raw = renderRaw(BASIC_TABLE, {
+      tableStyles: {
+        headStyles: { fillColor: [255, 0, 0] },
+        customize: (opts) => {
+          // Declarative override was already baked in: prove we can
+          // still overwrite it from the customize callback.
+          return {
+            ...opts,
+            headStyles: { ...opts.headStyles, fillColor: [0, 0, 255] },
+          };
+        },
+      },
+    });
+    expect(countRgbFill(raw, [0, 0, 255])).toBeGreaterThan(0);
+    expect(countRgbFill(raw, [255, 0, 0])).toBe(0);
+  });
+});
+
+describe('tableStyles – HTML tables', () => {
+  const HTML_TABLE = [
+    '<table>',
+    '  <tr><th>Name</th><th>Qty</th></tr>',
+    '  <tr><td>Apple</td><td>1</td></tr>',
+    '  <tr><td>Banana</td><td>2</td></tr>',
+    '</table>',
+  ].join('\n');
+
+  it('applies custom headStyles.fillColor to raw HTML tables too', () => {
+    const raw = renderRaw(HTML_TABLE, {
+      tableStyles: { headStyles: { fillColor: [200, 0, 100] } },
+    });
+    expect(countRgbFill(raw, [200, 0, 100])).toBeGreaterThan(0);
+  });
+
+  it('applies custom bodyStyles.textColor to raw HTML tables too', () => {
+    const raw = renderRaw(HTML_TABLE, {
+      tableStyles: { bodyStyles: { textColor: [40, 200, 40] } },
+    });
+    expect(countRgbFill(raw, [40, 200, 40])).toBeGreaterThan(0);
+  });
+
+  it('customize runs for HTML tables and receives the merged options', () => {
+    const customize = jest.fn((o: { [k: string]: unknown }) => o);
+    render(HTML_TABLE, { tableStyles: { customize: customize as never } });
+    expect(customize).toHaveBeenCalledTimes(1);
+    expect(customize.mock.calls[0][0]).toHaveProperty('head');
+    expect(customize.mock.calls[0][0]).toHaveProperty('body');
+  });
+});
+
+describe('tableStyles – rich cells honour custom styling', () => {
+  it('preserves inline bold/italic inside a cell with a custom table font size', () => {
+    const md = [
+      '| Name         | Price |',
+      '|--------------|-------|',
+      '| **Apple**    | €1.20 |',
+      '| *Banana*     | €0.80 |',
+    ].join('\n');
+    const doc = render(md, {
+      tableStyles: { styles: { fontSize: 14 } },
+    });
+    const tokens = extractPositioned(doc).map((t) => t.text);
+    expect(tokens).toEqual(expect.arrayContaining(['Apple', 'Banana']));
+  });
+
+  it('uses bodyStyles.textColor as the default run colour for rich cells', () => {
+    const md = [
+      '| Name      | Note          |',
+      '|-----------|---------------|',
+      '| Apple     | **bold** text |',
+    ].join('\n');
+    const raw = renderRaw(md, {
+      tableStyles: { bodyStyles: { textColor: [180, 40, 40] } },
+    });
+    expect(countRgbFill(raw, [180, 40, 40])).toBeGreaterThan(0);
   });
 });

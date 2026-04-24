@@ -1,7 +1,7 @@
 {
   "name": "jspdf-markdown",
   "version": "1.0.0",
-  "description": "jspdf + jspdf-autotable with comprehensive markdown support",
+  "description": "Render Markdown into jsPDF with full inline formatting, styled tables (incl. merged cells), and a precise positional layout API (columns, headers/footers, measurement).",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -17,7 +17,13 @@
     "jspdf",
     "markdown",
     "pdf",
-    "autotable"
+    "autotable",
+    "table-styling",
+    "layout",
+    "columns",
+    "header-footer",
+    "gfm",
+    "typescript"
   ],
   "author": "Mark Joseph Solidarios",
   "license": "MIT",
