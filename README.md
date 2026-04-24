@@ -546,4 +546,4 @@ suffixes, table content, alignment, merged cells, …), not just
 
 ## License
 
-ISC
+MIT
