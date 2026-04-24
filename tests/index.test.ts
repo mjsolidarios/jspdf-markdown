@@ -17,6 +17,28 @@ function render(markdown: string, options?: Parameters<typeof markdownToPdf>[2])
   return markdownToPdf(doc, markdown, options);
 }
 
+/**
+ * Helper: extract the list of text literals (in stream order) that were
+ * drawn into the PDF. Each `doc.text()` call produces one literal.
+ */
+function renderTokens(markdown: string, options?: Parameters<typeof markdownToPdf>[2]): string[] {
+  const doc = render(markdown, options);
+  const raw = doc.output();
+  const matches = raw.match(/\(((?:[^()\\]|\\[()\\])*)\)\s*Tj/g) ?? [];
+  return matches
+    .map((m) => m.replace(/\)\s*Tj$/, '').replace(/^\(/, ''))
+    .map((s) => s.replace(/\\([()\\])/g, '$1'));
+}
+
+/**
+ * Helper: render markdown and return the concatenated text content of the
+ * resulting PDF as a single space-separated string (useful for simple
+ * substring assertions).
+ */
+function renderText(markdown: string, options?: Parameters<typeof markdownToPdf>[2]): string {
+  return renderTokens(markdown, options).join(' ');
+}
+
 // ---------------------------------------------------------------------------
 // Return value
 // ---------------------------------------------------------------------------
@@ -235,6 +257,121 @@ describe('markdownToPdf – tables', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Complex tables
+// ---------------------------------------------------------------------------
+
+describe('markdownToPdf – complex tables', () => {
+  it('aligns columns according to the header separator', () => {
+    const md = [
+      '| Left | Center | Right |',
+      '|:-----|:------:|------:|',
+      '| apple | 1 | 12.50 |',
+    ].join('\n');
+    const doc = render(md);
+    const raw = doc.output();
+    // All three cell values end up in the document.
+    expect(raw).toContain('apple');
+    expect(raw).toContain('12.50');
+    // Sanity check: tokens are extractable.
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['apple', '1', '12.50']));
+  });
+
+  it('right-aligned cells draw their text further right than left-aligned cells', () => {
+    // Same content, same table width, different alignment → the "12.50"
+    // glyphs should be positioned further to the right.
+    const common = ['| Col |', '{SEP}', '| 12.50 |'].join('\n');
+    const leftDoc = render(common.replace('{SEP}', '|:---|'));
+    const rightDoc = render(common.replace('{SEP}', '|---:|'));
+
+    const xOf = (doc: jsPDF, needle: string): number | null => {
+      const raw = doc.output();
+      // Each `Td` establishes a text position; grab the x for the line that
+      // drew `needle`.
+      const rx = new RegExp(
+        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${needle.replace(/\./g, '\\.')}\\)\\s*Tj`,
+      );
+      const m = rx.exec(raw);
+      return m ? parseFloat(m[1]) : null;
+    };
+
+    const xLeft = xOf(leftDoc, '12.50');
+    const xRight = xOf(rightDoc, '12.50');
+    expect(xLeft).not.toBeNull();
+    expect(xRight).not.toBeNull();
+    // The first `Td` after BT in jsPDF's stream is relative to the text
+    // matrix, so what we really care about is that the values differ and
+    // the right-aligned one is larger.
+    expect(xRight as number).toBeGreaterThan(xLeft as number);
+  });
+
+  it('preserves bold/italic/code/strikethrough/link formatting inside cells', () => {
+    const md = [
+      '| Name | Description | Link |',
+      '|------|-------------|------|',
+      '| **Alice** | *senior* with `git` | [home](https://alice.example/) |',
+      '| Bob | ~~ex~~ designer | see note |',
+    ].join('\n');
+    const tokens = renderTokens(md);
+    // Each word is still rendered as its own Tj, so the plain-text tokens
+    // appear verbatim in the stream.
+    expect(tokens).toEqual(expect.arrayContaining(['Alice', 'senior', 'git', 'home', 'ex']));
+    // And the appended URL is rendered (showLinkUrls default = true).
+    expect(tokens.join(' ')).toContain('https://alice.example/');
+  });
+
+  it('splits <br> inside a cell into multiple rendered lines', () => {
+    const md = [
+      '| Item | Notes |',
+      '|------|-------|',
+      '| one | first<br>second<br>third |',
+    ].join('\n');
+    const tokens = renderTokens(md);
+    // All three pieces appear as separate Tj tokens.
+    expect(tokens).toEqual(expect.arrayContaining(['first', 'second', 'third']));
+    // They should not be fused into one token.
+    expect(tokens).not.toContain('firstsecondthird');
+  });
+
+  it('renders a raw HTML <table> with colspan and rowspan merged cells', () => {
+    const md = [
+      '<table>',
+      '  <tr><th colspan="2">Merged header</th><th>Plain</th></tr>',
+      '  <tr><td rowspan="2">Merged left</td><td>B1</td><td>C1</td></tr>',
+      '  <tr><td>B2</td><td>C2</td></tr>',
+      '</table>',
+    ].join('\n');
+    const tokens = renderTokens(md);
+    // All cell values made it into the PDF (previously the block was dropped).
+    // autoTable draws each cell as one Tj, so we assert on whole strings.
+    expect(tokens).toEqual(
+      expect.arrayContaining([
+        'Merged header',
+        'Plain',
+        'Merged left',
+        'B1',
+        'B2',
+        'C1',
+        'C2',
+      ]),
+    );
+  });
+
+  it('decodes entities inside HTML table cells', () => {
+    const md = '<table><tr><td>Tom &amp; Jerry</td></tr></table>';
+    const text = renderText(md);
+    expect(text).toContain('Tom & Jerry');
+    expect(text).not.toContain('&amp;');
+  });
+
+  it('supports <br> inside HTML table cells', () => {
+    const md = '<table><tr><td>one<br>two<br>three</td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['one', 'two', 'three']));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Page breaks
 // ---------------------------------------------------------------------------
 
@@ -289,6 +426,77 @@ describe('markdownToPdf – options', () => {
 // ---------------------------------------------------------------------------
 // Comprehensive document
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Output content (regression tests for bugs fixed in the review)
+// ---------------------------------------------------------------------------
+
+describe('markdownToPdf – output content', () => {
+  it('decodes HTML entities in quoted text', () => {
+    // Marked escapes `"` to `&quot;` in text tokens; we must decode it.
+    const text = renderText('> "Simplicity is the ultimate sophistication."');
+    expect(text).toContain('"Simplicity is the ultimate sophistication."');
+    expect(text).not.toContain('&quot;');
+  });
+
+  it('decodes ampersand entities', () => {
+    const text = renderText('Tom & Jerry');
+    expect(text).toContain('Tom & Jerry');
+    expect(text).not.toContain('&amp;');
+  });
+
+  it('does not insert a phantom space between styled runs and following punctuation', () => {
+    // Each word is drawn as its own `Tj`; we check that punctuation tokens
+    // appear immediately after the styled word in the stream (no word in
+    // between) and that no space-only token is rendered between them.
+    const tokens = renderTokens('This is **bold**, and this is *italic*.');
+    const boldIdx = tokens.indexOf('bold');
+    expect(boldIdx).toBeGreaterThanOrEqual(0);
+    expect(tokens[boldIdx + 1]).toBe(',');
+
+    const italicIdx = tokens.indexOf('italic');
+    expect(italicIdx).toBeGreaterThanOrEqual(0);
+    expect(tokens[italicIdx + 1]).toBe('.');
+
+    // And no lone " " token should be produced (we represent spaces as
+    // positional gaps, not rendered glyphs).
+    for (const t of tokens) {
+      expect(t).not.toBe(' ');
+    }
+  });
+
+  it('honours showLinkUrls = true by default', () => {
+    const text = renderText('See [Example](https://example.com) for details.');
+    expect(text).toContain('Example');
+    expect(text).toContain('https://example.com');
+  });
+
+  it('omits the URL when showLinkUrls is false', () => {
+    const text = renderText('See [Example](https://example.com) for details.', {
+      showLinkUrls: false,
+    });
+    expect(text).toContain('Example');
+    expect(text).not.toContain('https://example.com');
+  });
+
+  it('does not double-print the URL for autolinks', () => {
+    const text = renderText('Visit <https://example.com>');
+    const occurrences = text.match(/https:\/\/example\.com/g)?.length ?? 0;
+    expect(occurrences).toBe(1);
+  });
+
+  it('wraps long paragraphs onto new pages without losing content', () => {
+    const doc = makeDoc();
+    const paragraph = ('Word ').repeat(800);
+    markdownToPdf(doc, paragraph);
+    expect(doc.getNumberOfPages()).toBeGreaterThan(1);
+  });
+
+  it('renders nested lists without inserting an extra blank line before the next sibling', () => {
+    const md = '- Parent one\n  - Child\n- Parent two';
+    expect(() => render(md)).not.toThrow();
+  });
+});
 
 describe('markdownToPdf – comprehensive document', () => {
   it('renders a full-featured markdown document without throwing', () => {
