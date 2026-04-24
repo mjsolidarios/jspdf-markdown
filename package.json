@@ -1,6 +1,6 @@
 {
   "name": "jspdf-markdown",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Render Markdown into jsPDF with full inline formatting, styled tables (incl. merged cells), and a precise positional layout API (columns, headers/footers, measurement).",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
