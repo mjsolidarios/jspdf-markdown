@@ -2,6 +2,14 @@ import { jsPDF } from 'jspdf';
 import { markdownToPdf, MarkdownLayout } from '../src/index';
 
 /**
+ * Escape all regex special characters in `s` so the result can safely be
+ * embedded in a `new RegExp(...)` constructor.
+ */
+function escapeForRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Helper: create a fresh jsPDF document for testing.
  */
 function makeDoc(): jsPDF {
@@ -289,7 +297,7 @@ describe('markdownToPdf – complex tables', () => {
       // Each `Td` establishes a text position; grab the x for the line that
       // drew `needle`.
       const rx = new RegExp(
-        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${needle.replace(/\./g, '\\.')}\\)\\s*Tj`,
+        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${escapeForRegex(needle)}\\)\\s*Tj`,
       );
       const m = rx.exec(raw);
       return m ? parseFloat(m[1]) : null;
@@ -1351,10 +1359,8 @@ describe('HTML table – cell alignment', () => {
 
     const xOf = (doc: jsPDF, needle: string): number | null => {
       const raw = doc.output();
-      // Escape all regex special characters in `needle` before embedding it.
-      const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const rx = new RegExp(
-        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${escaped}\\)\\s*Tj`,
+        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${escapeForRegex(needle)}\\)\\s*Tj`,
       );
       const m = rx.exec(raw);
       return m ? parseFloat(m[1]) : null;

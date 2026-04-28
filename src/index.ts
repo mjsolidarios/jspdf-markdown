@@ -276,14 +276,14 @@ function decodeEntities(s: string): string {
     .replace(/&yen;/g, '\u00A5')
     .replace(/&cent;/g, '\u00A2')
     // Generic decimal numeric entities &#NNN;
-    .replace(/&#(\d+);/g, (_, n: string) => {
+    .replace(/&#(\d+);/g, (match: string, n: string) => {
       try { return String.fromCodePoint(parseInt(n, 10)); }
-      catch { return ''; }
+      catch { return match; }
     })
     // Generic hex numeric entities &#xHHH;
-    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => {
+    .replace(/&#x([0-9a-f]+);/gi, (match: string, h: string) => {
       try { return String.fromCodePoint(parseInt(h, 16)); }
-      catch { return ''; }
+      catch { return match; }
     })
     // keep `&amp;` last so we do not double-decode
     .replace(/&amp;/g, '&');
@@ -1415,41 +1415,80 @@ function parseCellAlign(attrs: string): 'left' | 'center' | 'right' | undefined 
 }
 
 /**
- * Convert the raw HTML content of a table cell to a list of styled
- * {@link TextRun}s, enabling bold, italic, code, links, and strikethrough
- * inside HTML table cells — just like GFM pipe-table cells.
+ * Convert raw HTML cell content to a list of styled {@link TextRun}s,
+ * enabling bold, italic, code, links, and strikethrough inside HTML table
+ * cells — just like GFM pipe-table cells.
  *
- * Common inline HTML formatting tags are converted to their markdown
- * equivalents before the text is parsed by `inlineRunsFromMarkdown`:
- * - `<strong>`/`<b>` → `**…**`
- * - `<em>`/`<i>` → `*…*`
- * - `<code>` → `` `…` ``
- * - `<del>`/`<s>` → `~~…~~`
- * - `<a href="…">…</a>` → `[…](…)`
+ * Uses a single-pass regex over the raw HTML so that the output string can
+ * never contain `<…>` patterns (each tag is consumed exactly once and
+ * converted to its markdown equivalent or stripped). This avoids the
+ * multi-character sanitization concern that chained replacements exhibit.
  *
- * `<br>` tags are preserved as literal HTML so that `collectRuns` can
- * convert them to newline runs. All other tags are stripped.
+ * Recognised inline HTML tags are converted to markdown equivalents:
+ * - `<strong>`/`<b>` → `**`  and `</strong>`/`</b>` → `**`
+ * - `<em>`/`<i>` → `*` and `</em>`/`</i>` → `*`
+ * - `<code>` → `` ` `` and `</code>` → `` ` ``
+ * - `<del>`/`<s>` → `~~` and `</del>`/`</s>` → `~~`
+ * - `<a href="…">` → `[` (with href captured for the closing `](…)`)
+ * - `</a>` → `](href)`
+ * - `<br>` → `\\\n` (GFM hard line break)
+ * - All other tags → stripped (no output)
+ *
+ * Markdown inline syntax (`**bold**`, `*italic*`, `` `code` ``, etc.) in the
+ * text content between tags is also handled because the result is passed to
+ * `inlineRunsFromMarkdown`.
  */
 function htmlCellContentToRuns(rawContent: string, opts: ResolvedOptions): TextRun[] {
-  const md = rawContent
-    // Convert <br> to a GFM hard line break (backslash before newline) so
-    // that collectRuns produces a newline run. Doing this first means the
-    // subsequent tag-strip can be a simple unconditional replace with no
-    // negative lookahead.
-    .replace(/<br\s*\/?\s*>/gi, '\\\n')
-    // Convert common inline HTML formatting tags to markdown equivalents.
-    .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**')
-    .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, '**$1**')
-    .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, '*$1*')
-    .replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, '*$1*')
-    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
-    .replace(/<del\b[^>]*>([\s\S]*?)<\/del>/gi, '~~$1~~')
-    .replace(/<s\b[^>]*>([\s\S]*?)<\/s>/gi, '~~$1~~')
-    .replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
-    // Strip all remaining HTML tags unconditionally (safe because <br> was
-    // already converted to a hard line break above and this is a PDF
-    // rendering context, not HTML rendering).
-    .replace(/<[^>]*>/g, '');
+  let md = '';
+  let pendingLinkHref = '';
+
+  // Single-pass: match either <tag> or a run of non-tag characters.
+  const rx = /<([^>]*)>|([^<]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(rawContent)) !== null) {
+    if (m[2] !== undefined) {
+      // Non-tag text: pass through as-is (markdown syntax is preserved
+      // and will be parsed by inlineRunsFromMarkdown below).
+      md += m[2];
+    } else {
+      // HTML tag: convert known inline formatting tags; strip everything else.
+      const tag = m[1];
+      const lower = tag.toLowerCase().trim();
+      if (/^br\b/.test(lower)) {
+        // <br> → GFM hard line break (backslash before newline).
+        md += '\\\n';
+      } else if (/^(strong|b)\b/.test(lower)) {
+        md += '**';
+      } else if (/^\/(strong|b)\b/.test(lower)) {
+        md += '**';
+      } else if (/^(em|i)\b/.test(lower)) {
+        md += '*';
+      } else if (/^\/(em|i)\b/.test(lower)) {
+        md += '*';
+      } else if (/^code\b/.test(lower)) {
+        md += '`';
+      } else if (/^\/code\b/.test(lower)) {
+        md += '`';
+      } else if (/^(del|s)\b/.test(lower)) {
+        md += '~~';
+      } else if (/^\/(del|s)\b/.test(lower)) {
+        md += '~~';
+      } else if (/^a\b/.test(lower)) {
+        const hrefMatch = /\bhref\s*=\s*["']([^"']*)["']/i.exec(tag);
+        if (hrefMatch) {
+          pendingLinkHref = hrefMatch[1];
+          md += '[';
+        }
+      } else if (/^\/a\b/.test(lower)) {
+        if (pendingLinkHref) {
+          md += `](${pendingLinkHref})`;
+          pendingLinkHref = '';
+        }
+      }
+      // All other tags are silently stripped (no output).
+    }
+  }
+
   return inlineRunsFromMarkdown(decodeEntities(md), opts);
 }
 
