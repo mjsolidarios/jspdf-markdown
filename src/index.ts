@@ -278,11 +278,15 @@ function decodeEntities(s: string): string {
     // Generic decimal numeric entities &#NNN;
     .replace(/&#(\d+);/g, (match: string, n: string) => {
       try { return String.fromCodePoint(parseInt(n, 10)); }
+      // String.fromCodePoint throws RangeError for invalid code points
+      // (e.g. surrogates). Return the original entity so users can see it.
       catch { return match; }
     })
     // Generic hex numeric entities &#xHHH;
     .replace(/&#x([0-9a-f]+);/gi, (match: string, h: string) => {
       try { return String.fromCodePoint(parseInt(h, 16)); }
+      // String.fromCodePoint throws RangeError for invalid code points.
+      // Return the original entity so users can see it.
       catch { return match; }
     })
     // keep `&amp;` last so we do not double-decode
@@ -1596,7 +1600,12 @@ function renderHtmlTable(state: RenderState, rawHtml: string): RenderState | nul
   };
 
   const toCellDef = (c: ReturnType<typeof cellize>) => {
-    const def: Record<string, unknown> = {
+    const def: {
+      content: string;
+      colSpan: number;
+      rowSpan: number;
+      styles?: { halign: 'left' | 'center' | 'right' };
+    } = {
       content: c.plain,
       colSpan: c.colSpan,
       rowSpan: c.rowSpan,
