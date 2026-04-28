@@ -1351,8 +1351,10 @@ describe('HTML table – cell alignment', () => {
 
     const xOf = (doc: jsPDF, needle: string): number | null => {
       const raw = doc.output();
+      // Escape all regex special characters in `needle` before embedding it.
+      const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const rx = new RegExp(
-        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${needle.replace(/\./g, '\\.')}\\)\\s*Tj`,
+        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${escaped}\\)\\s*Tj`,
       );
       const m = rx.exec(raw);
       return m ? parseFloat(m[1]) : null;

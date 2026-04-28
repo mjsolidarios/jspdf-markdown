@@ -1432,6 +1432,12 @@ function parseCellAlign(attrs: string): 'left' | 'center' | 'right' | undefined 
  */
 function htmlCellContentToRuns(rawContent: string, opts: ResolvedOptions): TextRun[] {
   const md = rawContent
+    // Convert <br> to a GFM hard line break (backslash before newline) so
+    // that collectRuns produces a newline run. Doing this first means the
+    // subsequent tag-strip can be a simple unconditional replace with no
+    // negative lookahead.
+    .replace(/<br\s*\/?\s*>/gi, '\\\n')
+    // Convert common inline HTML formatting tags to markdown equivalents.
     .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**')
     .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, '**$1**')
     .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, '*$1*')
@@ -1440,9 +1446,10 @@ function htmlCellContentToRuns(rawContent: string, opts: ResolvedOptions): TextR
     .replace(/<del\b[^>]*>([\s\S]*?)<\/del>/gi, '~~$1~~')
     .replace(/<s\b[^>]*>([\s\S]*?)<\/s>/gi, '~~$1~~')
     .replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
-    // Preserve <br> tags (collectRuns converts them to newline runs);
-    // strip all other remaining HTML tags.
-    .replace(/<(?!\/?br\b)[^>]+>/gi, '');
+    // Strip all remaining HTML tags unconditionally (safe because <br> was
+    // already converted to a hard line break above and this is a PDF
+    // rendering context, not HTML rendering).
+    .replace(/<[^>]*>/g, '');
   return inlineRunsFromMarkdown(decodeEntities(md), opts);
 }
 
