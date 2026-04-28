@@ -235,9 +235,10 @@ function resolveOptions(opts?: MarkdownToPdfOptions): ResolvedOptions {
 }
 
 /**
- * Decode the subset of HTML entities that `marked` inserts when escaping text.
- * Marked emits HTML-safe text by default (even in its lexer), so we have to
- * turn `&quot;`, `&amp;`, etc. back into literal characters before drawing.
+ * Decode HTML entities. Handles the named entities that `marked` inserts
+ * when escaping text (e.g. `&quot;`, `&amp;`), common typographic entities
+ * (`&mdash;`, `&ldquo;`, `&hellip;`, …), and all decimal / hexadecimal
+ * numeric entities (`&#169;`, `&#x00A9;`).
  */
 function decodeEntities(s: string): string {
   return s
@@ -247,7 +248,43 @@ function decodeEntities(s: string): string {
     .replace(/&#x2F;/gi, '/')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
+    .replace(/&nbsp;/g, '\u00A0')
+    // Common typographic named entities
+    .replace(/&mdash;/g, '\u2014')
+    .replace(/&ndash;/g, '\u2013')
+    .replace(/&ldquo;/g, '\u201C')
+    .replace(/&rdquo;/g, '\u201D')
+    .replace(/&lsquo;/g, '\u2018')
+    .replace(/&rsquo;/g, '\u2019')
+    .replace(/&hellip;/g, '\u2026')
+    .replace(/&bull;/g, '\u2022')
+    .replace(/&middot;/g, '\u00B7')
+    .replace(/&copy;/g, '\u00A9')
+    .replace(/&reg;/g, '\u00AE')
+    .replace(/&trade;/g, '\u2122')
+    .replace(/&deg;/g, '\u00B0')
+    .replace(/&plusmn;/g, '\u00B1')
+    .replace(/&times;/g, '\u00D7')
+    .replace(/&divide;/g, '\u00F7')
+    .replace(/&frac12;/g, '\u00BD')
+    .replace(/&frac14;/g, '\u00BC')
+    .replace(/&frac34;/g, '\u00BE')
+    .replace(/&laquo;/g, '\u00AB')
+    .replace(/&raquo;/g, '\u00BB')
+    .replace(/&euro;/g, '\u20AC')
+    .replace(/&pound;/g, '\u00A3')
+    .replace(/&yen;/g, '\u00A5')
+    .replace(/&cent;/g, '\u00A2')
+    // Generic decimal numeric entities &#NNN;
+    .replace(/&#(\d+);/g, (_, n: string) => {
+      try { return String.fromCodePoint(parseInt(n, 10)); }
+      catch { return ''; }
+    })
+    // Generic hex numeric entities &#xHHH;
+    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => {
+      try { return String.fromCodePoint(parseInt(h, 16)); }
+      catch { return ''; }
+    })
     // keep `&amp;` last so we do not double-decode
     .replace(/&amp;/g, '&');
 }
@@ -1352,9 +1389,61 @@ function renderTable(state: RenderState, token: Tokens.Table): RenderState {
 /** One cell extracted from a raw HTML `<table>`. */
 interface HtmlTableCell {
   header: boolean;
+  /** Plain-text content (HTML tags stripped, entities decoded, `<br>` → `\n`). */
   content: string;
+  /** Raw HTML content as it appeared between the opening and closing cell tag. */
+  rawContent: string;
   colSpan: number;
   rowSpan: number;
+  /** Horizontal alignment from `align` attribute or `text-align` CSS, if present. */
+  align?: 'left' | 'center' | 'right';
+}
+
+/**
+ * Extract the horizontal alignment from HTML cell attributes.
+ * Recognises the `align` attribute and `text-align` in an inline `style`.
+ */
+function parseCellAlign(attrs: string): 'left' | 'center' | 'right' | undefined {
+  const alignAttr = /\balign\s*=\s*["']?(left|center|right)["']?/i.exec(attrs);
+  if (alignAttr) return alignAttr[1].toLowerCase() as 'left' | 'center' | 'right';
+  const styleAttr = /\bstyle\s*=\s*["']([^"']*)["']/i.exec(attrs);
+  if (styleAttr) {
+    const textAlign = /text-align\s*:\s*(left|center|right)/i.exec(styleAttr[1]);
+    if (textAlign) return textAlign[1].toLowerCase() as 'left' | 'center' | 'right';
+  }
+  return undefined;
+}
+
+/**
+ * Convert the raw HTML content of a table cell to a list of styled
+ * {@link TextRun}s, enabling bold, italic, code, links, and strikethrough
+ * inside HTML table cells — just like GFM pipe-table cells.
+ *
+ * Common inline HTML formatting tags are converted to their markdown
+ * equivalents before the text is parsed by `inlineRunsFromMarkdown`:
+ * - `<strong>`/`<b>` → `**…**`
+ * - `<em>`/`<i>` → `*…*`
+ * - `<code>` → `` `…` ``
+ * - `<del>`/`<s>` → `~~…~~`
+ * - `<a href="…">…</a>` → `[…](…)`
+ *
+ * `<br>` tags are preserved as literal HTML so that `collectRuns` can
+ * convert them to newline runs. All other tags are stripped.
+ */
+function htmlCellContentToRuns(rawContent: string, opts: ResolvedOptions): TextRun[] {
+  const md = rawContent
+    .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**')
+    .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, '**$1**')
+    .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, '*$1*')
+    .replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, '*$1*')
+    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
+    .replace(/<del\b[^>]*>([\s\S]*?)<\/del>/gi, '~~$1~~')
+    .replace(/<s\b[^>]*>([\s\S]*?)<\/s>/gi, '~~$1~~')
+    .replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+    // Preserve <br> tags (collectRuns converts them to newline runs);
+    // strip all other remaining HTML tags.
+    .replace(/<(?!\/?br\b)[^>]+>/gi, '');
+  return inlineRunsFromMarkdown(decodeEntities(md), opts);
 }
 
 /**
@@ -1375,6 +1464,7 @@ function parseHtmlTableRows(html: string): HtmlTableCell[][] {
       const rawContent = cm[3];
       const colspanMatch = /colspan\s*=\s*["']?(\d+)/i.exec(attrs);
       const rowspanMatch = /rowspan\s*=\s*["']?(\d+)/i.exec(attrs);
+      const align = parseCellAlign(attrs);
       const content = decodeEntities(
         rawContent
           .replace(/<br\s*\/?\s*>/gi, '\n')
@@ -1384,8 +1474,10 @@ function parseHtmlTableRows(html: string): HtmlTableCell[][] {
       cells.push({
         header: tag === 'th',
         content,
+        rawContent,
         colSpan: colspanMatch ? parseInt(colspanMatch[1], 10) : 1,
         rowSpan: rowspanMatch ? parseInt(rowspanMatch[1], 10) : 1,
+        align,
       });
     }
     rows.push(cells);
@@ -1436,17 +1528,57 @@ function renderHtmlTable(state: RenderState, rawHtml: string): RenderState | nul
 
   const { doc, opts } = state;
 
-  const toCellDef = (c: HtmlTableCell) => ({
-    content: c.content,
-    colSpan: c.colSpan,
-    rowSpan: c.rowSpan,
-  });
+  // Build rich cell content (inline HTML + markdown aware).
+  const cellize = (c: HtmlTableCell) => {
+    const runs = htmlCellContentToRuns(c.rawContent, opts);
+    return {
+      plain: c.content,
+      runs,
+      align: c.align,
+      colSpan: c.colSpan,
+      rowSpan: c.rowSpan,
+    };
+  };
+
+  const richHead = headRows.map((r) => r.map(cellize));
+  const richBody = bodyRows.map((r) => r.map(cellize));
+
+  const richFor = (section: string, rowIdx: number, colIdx: number) => {
+    if (section === 'head') return richHead[rowIdx]?.[colIdx];
+    if (section === 'body') return richBody[rowIdx]?.[colIdx];
+    return undefined;
+  };
+
+  const toCellDef = (c: ReturnType<typeof cellize>) => {
+    const def: Record<string, unknown> = {
+      content: c.plain,
+      colSpan: c.colSpan,
+      rowSpan: c.rowSpan,
+    };
+    if (c.align) {
+      def.styles = { halign: c.align };
+    }
+    return def;
+  };
 
   const base = buildTableOptions(state);
   const options = finaliseTableOptions(opts, {
     ...base,
-    head: headRows.map((r) => r.map(toCellDef)),
-    body: bodyRows.map((r) => r.map(toCellDef)),
+    head: richHead.map((r) => r.map(toCellDef)),
+    body: richBody.map((r) => r.map(toCellDef)),
+    willDrawCell: (data) => {
+      const rich = richFor(data.section, data.row.index, data.column.index);
+      if (rich && hasInlineStyling(rich.runs)) {
+        // Suppress autoTable's default text; we draw styled runs in didDrawCell.
+        data.cell.text = [];
+      }
+    },
+    didDrawCell: (data) => {
+      const rich = richFor(data.section, data.row.index, data.column.index);
+      if (rich && hasInlineStyling(rich.runs)) {
+        drawRichCell(doc, opts, data.cell, rich.runs, data.section === 'head');
+      }
+    },
   });
 
   autoTable(doc, options);

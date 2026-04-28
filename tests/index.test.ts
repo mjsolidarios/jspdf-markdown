@@ -1243,3 +1243,223 @@ describe('tableStyles – rich cells honour custom styling', () => {
     expect(countRgbFill(raw, [180, 40, 40])).toBeGreaterThan(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// HTML table improvements – inline formatting, alignment, entity decoding
+// ---------------------------------------------------------------------------
+
+describe('HTML table – inline markdown in cells', () => {
+  it('renders **bold** inside an HTML table cell', () => {
+    const md = '<table><tr><th>Name</th></tr><tr><td>**Alice**</td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['Alice']));
+  });
+
+  it('renders *italic* inside an HTML table cell', () => {
+    const md = '<table><tr><th>X</th></tr><tr><td>*italic*</td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['italic']));
+  });
+
+  it('renders `code` inside an HTML table cell', () => {
+    const md = '<table><tr><th>X</th></tr><tr><td>`fn()`</td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['fn()']));
+  });
+
+  it('renders ~~strikethrough~~ inside an HTML table cell', () => {
+    const md = '<table><tr><th>X</th></tr><tr><td>~~old~~</td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['old']));
+  });
+
+  it('renders [links](…) inside an HTML table cell', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td>[home](https://example.com)</td></tr></table>';
+    const text = renderText(md);
+    expect(text).toContain('home');
+    expect(text).toContain('https://example.com');
+  });
+
+  it('renders <strong> HTML tag inside an HTML table cell as bold', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td><strong>Bold</strong></td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['Bold']));
+  });
+
+  it('renders <em> HTML tag inside an HTML table cell as italic', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td><em>Italic</em></td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['Italic']));
+  });
+
+  it('renders <code> HTML tag inside an HTML table cell as code', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td><code>fn()</code></td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['fn()']));
+  });
+
+  it('renders <del> HTML tag inside an HTML table cell as strikethrough', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td><del>removed</del></td></tr></table>';
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['removed']));
+  });
+
+  it('renders <a href="…"> inside an HTML table cell as a link', () => {
+    const md =
+      '<table><tr><th>X</th></tr><tr><td><a href="https://example.com">link text</a></td></tr></table>';
+    const text = renderText(md);
+    expect(text).toContain('link');
+    expect(text).toContain('text');
+    expect(text).toContain('https://example.com');
+  });
+
+  it('renders mixed HTML and markdown formatting in the same cell', () => {
+    const md = [
+      '<table>',
+      '  <tr><th>Name</th><th>Note</th></tr>',
+      '  <tr><td><strong>Alice</strong></td><td>*senior* with `git`</td></tr>',
+      '</table>',
+    ].join('\n');
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['Alice', 'senior', 'git']));
+  });
+});
+
+describe('HTML table – cell alignment', () => {
+  it('applies align="center" from <td> attribute', () => {
+    const md = [
+      '<table>',
+      '  <tr><th>Left</th><th align="center">Center</th><th align="right">Right</th></tr>',
+      '  <tr><td>a</td><td align="center">b</td><td align="right">c</td></tr>',
+      '</table>',
+    ].join('\n');
+    expect(() => render(md)).not.toThrow();
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['a', 'b', 'c']));
+  });
+
+  it('right-aligned <td> draws text further right than a left-aligned <td>', () => {
+    const leftMd =
+      '<table><tr><th>X</th></tr><tr><td align="left">12.50</td></tr></table>';
+    const rightMd =
+      '<table><tr><th>X</th></tr><tr><td align="right">12.50</td></tr></table>';
+
+    const xOf = (doc: jsPDF, needle: string): number | null => {
+      const raw = doc.output();
+      const rx = new RegExp(
+        `([-\\d.]+)\\s+([-\\d.]+)\\s+Td\\s*\\(${needle.replace(/\./g, '\\.')}\\)\\s*Tj`,
+      );
+      const m = rx.exec(raw);
+      return m ? parseFloat(m[1]) : null;
+    };
+
+    const xLeft = xOf(render(leftMd), '12.50');
+    const xRight = xOf(render(rightMd), '12.50');
+    expect(xLeft).not.toBeNull();
+    expect(xRight).not.toBeNull();
+    expect(xRight as number).toBeGreaterThan(xLeft as number);
+  });
+
+  it('applies text-align from inline style attribute', () => {
+    const md = [
+      '<table>',
+      '  <tr><th>X</th></tr>',
+      '  <tr><td style="text-align: right">99.99</td></tr>',
+      '</table>',
+    ].join('\n');
+    expect(() => render(md)).not.toThrow();
+    const tokens = renderTokens(md);
+    expect(tokens).toEqual(expect.arrayContaining(['99.99']));
+  });
+});
+
+describe('decodeEntities – expanded entity support', () => {
+  // jsPDF's built-in fonts (Helvetica/Courier) cover Latin-1 (0x20-0xFF) and
+  // a handful of Windows-1252 extras. Characters outside that set are silently
+  // dropped by jsPDF's string encoding, so tests below verify entity decoding
+  // occurred (entity code not present in the output) rather than asserting on
+  // the rendered Unicode glyph, which may not survive the PDF font encoding.
+
+  it('decodes &mdash; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>A&mdash;B</td></tr></table>');
+    // The surrounding letters must survive.
+    expect(text).toContain('A');
+    expect(text).toContain('B');
+    // The entity code must not appear literally.
+    expect(text).not.toContain('mdash');
+    expect(text).not.toContain('&mdash;');
+  });
+
+  it('decodes &ndash; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>1&ndash;10</td></tr></table>');
+    expect(text).not.toContain('ndash');
+    expect(text).not.toContain('&ndash;');
+  });
+
+  it('decodes &hellip; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>wait&hellip;</td></tr></table>');
+    expect(text).toContain('wait');
+    expect(text).not.toContain('hellip');
+    expect(text).not.toContain('&hellip;');
+  });
+
+  it('decodes &copy; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>&copy; 2024</td></tr></table>');
+    expect(text).not.toContain('&copy;');
+    expect(text).not.toContain('copy;');
+    // The year must survive.
+    expect(text).toContain('2024');
+  });
+
+  it('decodes &euro; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>&euro;9.99</td></tr></table>');
+    expect(text).not.toContain('&euro;');
+    expect(text).not.toContain('euro;');
+    // The numeric part must survive.
+    expect(text).toContain('9.99');
+  });
+
+  it('decodes &ldquo; and &rdquo; without leaving raw entity codes in the output', () => {
+    const text = renderText('<table><tr><td>&ldquo;hello&rdquo;</td></tr></table>');
+    expect(text).toContain('hello');
+    expect(text).not.toContain('ldquo');
+    expect(text).not.toContain('rdquo');
+  });
+
+  it('decodes &times; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>3&times;4</td></tr></table>');
+    expect(text).not.toContain('&times;');
+    expect(text).not.toContain('times;');
+  });
+
+  it('decodes &pound; without leaving the raw entity code in the output', () => {
+    const text = renderText('<table><tr><td>&pound;5.00</td></tr></table>');
+    expect(text).not.toContain('&pound;');
+    expect(text).not.toContain('pound;');
+    expect(text).toContain('5.00');
+  });
+
+  it('decodes decimal numeric entities (&#174; → ®) without leaving the entity code', () => {
+    const text = renderText('<table><tr><td>&#174; Corp</td></tr></table>');
+    expect(text).not.toContain('&#174;');
+    expect(text).toContain('Corp');
+  });
+
+  it('decodes hex numeric entities (&#xA9; → ©) without leaving the entity code', () => {
+    const text = renderText('<table><tr><td>&#xA9; Corp</td></tr></table>');
+    expect(text).not.toContain('&#xA9;');
+    expect(text).toContain('Corp');
+  });
+
+  it('decodes &laquo; and &raquo; without leaving entity codes in the output', () => {
+    const text = renderText('<table><tr><td>&laquo;text&raquo;</td></tr></table>');
+    expect(text).toContain('text');
+    expect(text).not.toContain('laquo');
+    expect(text).not.toContain('raquo');
+  });
+});
